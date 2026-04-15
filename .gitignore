@@ -1,0 +1,25 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# Shiny
+rsconnect/
+
+# Output / temp files
+*.pdf
+*.xlsx
+*.png
+!docs/screenshots/*.png
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+*.swp
+*~

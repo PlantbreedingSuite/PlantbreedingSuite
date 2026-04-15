@@ -1,0 +1,49 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "Plant Breeding Analytics Suite"
+abstract: >
+  A unified R Shiny dashboard combining three analytical modules for plant
+  breeding research.
+version: "3.0"
+date-released: "2025-01-01"
+license: MIT
+repository-code: "https://github.com/vjkamal93/PlantBreedingSuite"
+authors:
+  - family-names: Meena
+    given-names: Vijay Kamal
+    affiliation: "Agriculture University Jodhpur, Rajasthan, India"
+    email: vjkamal93@gmail.com
+    orcid: https://orcid.org/0000-0002-1025-355X
+keywords:
+  - plant breeding
+  - R Shiny
+  - Mahalanobis D²
+  - Tocher clustering
+  - AMMI
+  - GGE biplot
+  - MTSI
+  - MGIDI
+  - FAI-BLUP
+  - Smith-Hazel index
+  - multi-environment trial
+  - wheat
+  - terminal heat stress
+references:
+  - type: article
+    title: "metan: An R package for multi-environment trial analysis"
+    authors:
+      - family-names: Olivoto
+        given-names: Tiago
+      - family-names: Lúcio
+        given-names: Alessandro Dal'Col
+    journal: "The Plant Phenome Journal"
+    year: 2020
+    doi: "10.1002/ppj2.20017"
+  - type: software
+    title: "biotools: Tools for Biometry and Applied Statistics in Agricultural Science"
+    authors:
+      - family-names: Silva
+        given-names: Anderson Rodrigo da
+    year: 2017
+    url: "https://CRAN.R-project.org/package=biotools"
