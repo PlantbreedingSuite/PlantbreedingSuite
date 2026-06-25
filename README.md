@@ -61,8 +61,8 @@ The repository includes real wheat (*Triticum aestivum* L.) phenotyping data col
 | GWPS | Grain weight per spike | g |
 | GNPS | Grain number per spike | No. |
 | SPMS | Spikes per m² | No. |
-| YPMS | Yield per m² | g |
-| BYPMS | Biological yield per m² | g |
+| YPMS | Yield per m² | kg |
+| BYPMS | Biological yield per m² | kg |
 | TGW | Thousand grain weight | g |
 
 ---
