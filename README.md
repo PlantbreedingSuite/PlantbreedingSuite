@@ -232,4 +232,4 @@ Please open an [issue](../../issues) or submit a pull request.
 
 ---
 
-*Plant Breeding Analytics Suite v3.0 | 2025 | Agriculture University Jodhpur*
+*Plant Breeding Analytics Suite v1.0 | 2025 | Agriculture University Jodhpur*
