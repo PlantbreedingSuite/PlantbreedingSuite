@@ -1939,7 +1939,7 @@ ui <- dashboardPage(
               tags$ul(tags$li("MTSI, MGIDI, FAI-BLUP, Smith-Hazel"),tags$li("Direct selection on yield trait"),tags$li("Selection differentials (Table 3)"),tags$li("Coincidence index & 4-way Venn diagram"),tags$li("GT/GYT biplots & Radar chart")),
               br(),
               p(strong("Key packages:"),"metan, biotools, FactoMineR, ggplot2, plotly, corrplot, fmsb"),
-              div(class="app-footer","Version 3.0 (Combined Suite) | 2025 | Agriculture University Jodhpur")
+              div(class="app-footer","Version 1.0 (Combined Suite) | 2025 | Agriculture University Jodhpur")
             )
           )
         )
