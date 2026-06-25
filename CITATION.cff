@@ -5,10 +5,10 @@ title: "Plant Breeding Analytics Suite"
 abstract: >
   A unified R Shiny dashboard combining three analytical modules for plant
   breeding research.
-version: "3.0"
+version: "1.0"
 date-released: "2025-01-01"
 license: MIT
-repository-code: "https://github.com/vjkamal93/PlantBreedingSuite"
+repository-code: "https://github.com/PlantbreedingSuite/PlantBreedingSuite"
 authors:
   - family-names: Meena
     given-names: Vijay Kamal
