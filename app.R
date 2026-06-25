@@ -76,6 +76,125 @@ dl_bar <- function(btn_id, label="⬇  Download HD PDF") {
 }
 
 # ════════════════════════════════════════════════════════════════
+#  SHARED DATA VALIDATION  (used by all 3 modules)
+# ════════════════════════════════════════════════════════════════
+# Reads an uploaded file safely and reports a clear reason if it fails.
+# Returns list(ok=TRUE/FALSE, data=<df or NULL>, msg=<reason if failed>).
+safe_read_file <- function(path, name, csv_only=FALSE) {
+  ext <- tolower(tools::file_ext(name))
+  allowed <- if (csv_only) "csv" else c("csv","xlsx","xls")
+  if (!ext %in% allowed)
+    return(list(ok=FALSE, data=NULL,
+      msg=paste0("Unsupported file type \u201C.", ext, "\u201D. Please upload a ",
+                 if (csv_only) "CSV (.csv) file." else "CSV or Excel (.csv / .xlsx / .xls) file.")))
+  df <- tryCatch({
+    if (ext == "csv") {
+      d <- read.csv(path, fileEncoding="UTF-8-BOM", stringsAsFactors=FALSE, check.names=FALSE)
+      if (ncol(d) <= 1) d <- read.csv(path, stringsAsFactors=FALSE, check.names=FALSE)
+      d
+    } else {
+      as.data.frame(readxl::read_excel(path), check.names=FALSE)
+    }
+  }, error=function(e) e)
+  if (inherits(df, "error"))
+    return(list(ok=FALSE, data=NULL,
+      msg=paste0("The file could not be read. It may be open in another program, corrupted, or not a real spreadsheet. Details: ", conditionMessage(df))))
+  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0 || ncol(df) == 0)
+    return(list(ok=FALSE, data=NULL, msg="The file appears to be empty. Please check that it contains a header row and data."))
+  # Blank / duplicated column names
+  nm <- names(df)
+  if (any(is.na(nm) | trimws(nm) == ""))
+    return(list(ok=FALSE, data=NULL, msg="One or more columns have no name in the header row. Please give every column a short name (no blank headers)."))
+  if (any(duplicated(nm)))
+    return(list(ok=FALSE, data=NULL,
+      msg=paste0("Duplicate column name(s): ", paste(unique(nm[duplicated(nm)]), collapse=", "),
+                 ". Each column must have a unique name.")))
+  list(ok=TRUE, data=df, msg=NULL)
+}
+
+# Checks required ID columns exist (case-insensitive) and that trait columns
+# are usable. `id_specs` is a named list: list(GEN="genotype", REP="replication", ...).
+# Returns list(ok, errors=<chr vector, fatal>, warnings=<chr vector, non-fatal>).
+validate_breeding_data <- function(df, id_cols, trait_cols, require_reps=TRUE) {
+  errors <- character(0); warnings <- character(0)
+  # 1. Need at least some trait columns
+  if (length(trait_cols) == 0)
+    errors <- c(errors, "No trait (measurement) columns were found. After the identifier columns you need at least one column of numeric trait values.")
+  # 2. Trait columns must be (mostly) numeric
+  bad_numeric <- character(0); all_na <- character(0)
+  for (tr in trait_cols) {
+    col <- df[[tr]]
+    num <- suppressWarnings(as.numeric(as.character(col)))
+    n_total <- length(num)
+    n_bad   <- sum(is.na(num) & !is.na(col) & trimws(as.character(col)) != "")
+    if (all(is.na(num))) {
+      all_na <- c(all_na, tr)
+    } else if (n_bad > 0) {
+      bad_numeric <- c(bad_numeric, paste0(tr, " (", n_bad, " text value", if (n_bad>1) "s" else "", ")"))
+    }
+  }
+  if (length(all_na) > 0)
+    errors <- c(errors, paste0("These trait column(s) contain no usable numbers (text or all blank): ",
+                               paste(all_na, collapse=", "),
+                               ". Remove units/labels from the cells, or remove the column."))
+  if (length(bad_numeric) > 0)
+    warnings <- c(warnings, paste0("Some trait cells contain text instead of numbers and will become blank/missing: ",
+                                   paste(bad_numeric, collapse=", "),
+                                   ". Check for stray letters, units (e.g. \u201Ccm\u201D), or notes inside number cells."))
+  # 3. Missing values overall
+  if (length(trait_cols) > 0) {
+    trait_df <- df[, trait_cols, drop=FALSE]
+    trait_df[] <- lapply(trait_df, function(c) suppressWarnings(as.numeric(as.character(c))))
+    n_miss <- sum(is.na(trait_df))
+    if (n_miss > 0) {
+      pct <- round(100 * n_miss / (nrow(trait_df) * ncol(trait_df)), 1)
+      warnings <- c(warnings, paste0(n_miss, " missing value(s) (", pct,
+        "%) detected in trait columns. Rows with missing data may be dropped or cause some analyses to error. Fill the gaps where possible."))
+    }
+  }
+  # 4. Genotype checks
+  if (!is.null(id_cols$GEN) && id_cols$GEN %in% names(df)) {
+    gens <- as.character(df[[id_cols$GEN]])
+    if (any(is.na(gens) | trimws(gens) == ""))
+      errors <- c(errors, "Some rows have a blank genotype name. Every row must name its genotype.")
+    gens_trim <- trimws(gens)
+    # whitespace / case inconsistencies that silently split a genotype
+    canon <- tolower(gsub("[[:space:]]+", "", gens_trim))
+    by_canon <- tapply(gens_trim, canon, function(x) length(unique(x)))
+    dupset <- names(by_canon)[by_canon > 1]
+    if (length(dupset) > 0) {
+      examples <- unique(unlist(lapply(dupset[seq_len(min(3, length(dupset)))],
+        function(k) unique(gens_trim[canon == k]))))
+      warnings <- c(warnings, paste0("Genotype names look inconsistent (differ only by spaces/capitals), so they may be counted as separate genotypes: ",
+        paste(head(examples, 6), collapse=", "), ". Make each name spelled identically."))
+    }
+    if (length(unique(gens_trim)) < 2)
+      errors <- c(errors, "Only one genotype was detected. At least two genotypes are needed for comparison.")
+  }
+  # 5. Replication / balance checks
+  if (require_reps && !is.null(id_cols$REP) && !is.null(id_cols$GEN) &&
+      id_cols$REP %in% names(df) && id_cols$GEN %in% names(df)) {
+    reps <- df[[id_cols$REP]]
+    if (length(unique(reps)) < 2)
+      warnings <- c(warnings, "Only one replication was detected. ANOVA-type analyses usually need 2 or more replications.")
+  }
+  list(ok = length(errors) == 0, errors = errors, warnings = warnings)
+}
+
+# Renders validation messages: fires notifications AND returns a UI alert block.
+show_validation_msgs <- function(v, context="data") {
+  for (e in v$errors)   showNotification(paste0("\u274C ", e), type="error",   duration=12)
+  for (w in v$warnings) showNotification(paste0("\u26A0\uFE0F ", w), type="warning", duration=12)
+  if (length(v$errors) == 0 && length(v$warnings) == 0) return(NULL)
+  mk <- function(items, col, bg, icon) lapply(items, function(t)
+    div(style=paste0("background:",bg,";border-left:4px solid ",col,";border-radius:6px;padding:8px 12px;margin-bottom:6px;font-size:12.5px;color:#222;"),
+        span(style=paste0("font-weight:700;color:",col,";"), icon, " "), t))
+  div(style="margin-bottom:12px;",
+    mk(v$errors,   "#C62828", "#FDEBEC", "\u274C Error:"),
+    mk(v$warnings, "#E65100", "#FFF6E5", "\u26A0\uFE0F Warning:"))
+}
+
+# ════════════════════════════════════════════════════════════════
 #  COMBINED CSS
 # ════════════════════════════════════════════════════════════════
 APP_CSS <- tags$style(HTML("
@@ -274,6 +393,7 @@ d2UI <- function(id) {
           actionButton(ns("btn_load"), "▶  Load & Validate Data", class="btn-success btn-block", icon=icon("play"))
         ),
         box(title="Data Preview", width=7, status="success", solidHeader=TRUE,
+          uiOutput(ns("val_alert")),
           uiOutput(ns("data_stats")), br(),
           h5("Raw Data (first 10 rows)", style="color:#2D6A4F;font-weight:700;"),
           withSpinner(DTOutput(ns("preview1")), color="#56d364"),
@@ -445,7 +565,7 @@ d2Server <- function(id) {
                          d_dist=NULL, dm=NULL, toc=NULL, cluster_vec=NULL,
                          n_clust=NULL, pal=NULL, pca_res=NULL, eig_val=NULL,
                          cor_mat=NULL, p_mat=NULL, mod=NULL, dv=NULL,
-                         loaded=FALSE, ran_manova=FALSE)
+                         loaded=FALSE, ran_manova=FALSE, valmsg=NULL)
 
     read_f <- function(p) {
       ext <- tolower(tools::file_ext(p))
@@ -453,16 +573,99 @@ d2Server <- function(id) {
     }
 
     observeEvent(input$btn_load, {
-      req(input$file1, input$file2)
-      tryCatch({
-        d1 <- read_f(input$file1$datapath); d2 <- read_f(input$file2$datapath)
-        rv$data1 <- d1; rv$data2 <- d2
-        ts <- input$trait_start
-        rv$gm <- aggregate(d1[ts:ncol(d1)], by=list(GEN=d1$GEN), mean)
+      rv$loaded <- FALSE; rv$valmsg <- NULL
+      if (is.null(input$file1) || is.null(input$file2)) {
+        rv$valmsg <- show_validation_msgs(list(errors=c(
+          "Please choose BOTH files before loading: the Raw Data file and the Genotype Means file."), warnings=character(0)))
+        showNotification("\u274C Both data files are required.", type="error", duration=10)
+        return()
+      }
+      r1 <- safe_read_file(input$file1$datapath, input$file1$name)
+      r2 <- safe_read_file(input$file2$datapath, input$file2$name)
+      fatal <- character(0)
+      if (!r1$ok) fatal <- c(fatal, paste0("Raw Data file: ", r1$msg))
+      if (!r2$ok) fatal <- c(fatal, paste0("Genotype Means file: ", r2$msg))
+      if (length(fatal) > 0) {
+        rv$valmsg <- show_validation_msgs(list(errors=fatal, warnings=character(0)))
+        return()
+      }
+      d1 <- r1$data; d2 <- r2$data
+      errors <- character(0); warnings <- character(0)
+
+      # Raw file must contain GEN and REP (any case)
+      gcol1 <- names(d1)[grep("^GEN$", names(d1), ignore.case=TRUE)][1]
+      rcol1 <- names(d1)[grep("^REP$", names(d1), ignore.case=TRUE)][1]
+      if (is.na(gcol1)) errors <- c(errors, "Raw Data file has no \u201CGEN\u201D (genotype) column. The raw file needs columns GEN, REP, then traits.")
+      if (is.na(rcol1)) errors <- c(errors, "Raw Data file has no \u201CREP\u201D (replication) column. The raw file needs columns GEN, REP, then traits.")
+      if (!is.na(gcol1) && gcol1 != "GEN") names(d1)[names(d1)==gcol1] <- "GEN"
+      if (!is.na(rcol1) && rcol1 != "REP") names(d1)[names(d1)==rcol1] <- "REP"
+
+      # Means file must contain GEN
+      gcol2 <- names(d2)[grep("^GEN$", names(d2), ignore.case=TRUE)][1]
+      if (is.na(gcol2)) errors <- c(errors, "Genotype Means file has no \u201CGEN\u201D column. It needs GEN, then one column per trait.")
+      if (!is.na(gcol2) && gcol2 != "GEN") names(d2)[names(d2)==gcol2] <- "GEN"
+
+      # trait_start sanity
+      ts <- suppressWarnings(as.integer(input$trait_start))
+      if (is.na(ts) || ts < 2) {
+        errors <- c(errors, "\u201CTrait start column\u201D must be 2 or more (column 1 is GEN). For the standard layout it is 3.")
+      } else if (ts > ncol(d1)) {
+        errors <- c(errors, paste0("\u201CTrait start column\u201D (", ts, ") is beyond the number of columns in the Raw Data file (", ncol(d1), "). Lower this value."))
+      }
+
+      # If structural errors, stop here
+      if (length(errors) > 0) {
+        rv$valmsg <- show_validation_msgs(list(errors=errors, warnings=warnings))
+        return()
+      }
+
+      # Content-level validation on raw traits
+      raw_traits <- names(d1)[ts:ncol(d1)]
+      raw_traits <- setdiff(raw_traits, c("GEN","REP"))
+      v1 <- validate_breeding_data(d1, list(GEN="GEN", REP="REP"), raw_traits, require_reps=TRUE)
+      mean_traits <- setdiff(names(d2), "GEN")
+      v2 <- validate_breeding_data(d2, list(GEN="GEN"), mean_traits, require_reps=FALSE)
+
+      # cross-file genotype consistency
+      g1 <- sort(unique(trimws(as.character(d1$GEN))))
+      g2 <- sort(unique(trimws(as.character(d2$GEN))))
+      only1 <- setdiff(g1, g2); only2 <- setdiff(g2, g1)
+      if (length(only1) > 0 || length(only2) > 0)
+        v2$warnings <- c(v2$warnings, paste0("Genotypes differ between the two files. ",
+          if (length(only1)>0) paste0(length(only1), " only in Raw data (e.g. ", paste(head(only1,4),collapse=", "), "). ") else "",
+          if (length(only2)>0) paste0(length(only2), " only in Means (e.g. ", paste(head(only2,4),collapse=", "), "). ") else "",
+          "D\u00B2 uses the Means file; mismatches can distort results."))
+
+      allerr <- c(v1$errors, v2$errors)
+      allwarn <- unique(c(v1$warnings, v2$warnings))
+      if (length(allerr) > 0) {
+        rv$valmsg <- show_validation_msgs(list(errors=allerr, warnings=allwarn))
+        return()
+      }
+
+      # Passed (warnings allowed) — finish loading
+      result <- tryCatch({
+        d1n <- d1
+        for (tr in raw_traits) d1n[[tr]] <- suppressWarnings(as.numeric(as.character(d1n[[tr]])))
+        rv$data1 <- d1n; rv$data2 <- d2
+        rv$gm <- aggregate(d1n[ts:ncol(d1n)], by=list(GEN=d1n$GEN), mean, na.rm=TRUE)
         rv$loaded <- TRUE
-        showNotification("✅ D² data loaded!", type="message")
-      }, error=function(e) showNotification(paste("❌",e$message), type="error"))
+        TRUE
+      }, error=function(e) e)
+      if (inherits(result, "error")) {
+        rv$valmsg <- show_validation_msgs(list(errors=paste0(
+          "The files were readable but processing failed: ", conditionMessage(result),
+          ". Check that GEN/REP columns and the trait-start column are correct."), warnings=character(0)))
+        return()
+      }
+      rv$valmsg <- show_validation_msgs(list(errors=character(0), warnings=allwarn))
+      if (length(allwarn) > 0)
+        showNotification("\u2705 D\u00B2 data loaded with warnings \u2014 review the notes above.", type="warning", duration=6)
+      else
+        showNotification("\u2705 D\u00B2 data loaded and validated!", type="message")
     })
+
+    output$val_alert <- renderUI({ rv$valmsg })
 
     output$data_stats <- renderUI({
       req(rv$loaded)
@@ -737,6 +940,7 @@ metUI <- function(id) {
           actionButton(ns("btn_load"), "⚙️  Load & Process Data", class="btn-success btn-block", icon=icon("play"))
         ),
         box(title="Data Exploration", width=8, status="success", solidHeader=TRUE,
+          uiOutput(ns("val_alert_met")),
           uiOutput(ns("value_boxes")),
           tabsetPanel(
             tabPanel("📋 Preview",       br(), DTOutput(ns("tbl_preview"))),
@@ -953,14 +1157,19 @@ metServer <- function(id) {
     raw_data       <- reactiveVal(NULL)
     processed_data <- reactiveVal(NULL)
 
+    met_valmsg <- reactiveVal(NULL)
+    output$val_alert_met <- renderUI({ met_valmsg() })
+
     observeEvent(input$file1, {
+      met_valmsg(NULL)
       req(input$file1)
-      ext <- tools::file_ext(input$file1$name)
-      df  <- tryCatch({
-        if (tolower(ext)=="csv") read.csv(input$file1$datapath, stringsAsFactors=FALSE)
-        else as.data.frame(readxl::read_excel(input$file1$datapath))
-      }, error=function(e){ showNotification(paste("❌ File error:",e$message),type="error"); NULL })
-      raw_data(df)
+      r <- safe_read_file(input$file1$datapath, input$file1$name)
+      if (!r$ok) {
+        met_valmsg(show_validation_msgs(list(errors=r$msg, warnings=character(0))))
+        raw_data(NULL); processed_data(NULL)
+        return()
+      }
+      raw_data(r$data)
     })
 
     observe({
@@ -972,18 +1181,43 @@ metServer <- function(id) {
     })
 
     observeEvent(input$btn_load, {
+      met_valmsg(NULL); processed_data(NULL)
       req(raw_data(), input$env_col, input$gen_col, input$rep_col)
       df <- raw_data()
+      errors <- character(0)
+      # mapped columns must exist and be distinct
+      mapped <- c(ENV=input$env_col, GEN=input$gen_col, REP=input$rep_col)
+      missing <- mapped[!mapped %in% names(df)]
+      if (length(missing) > 0)
+        errors <- c(errors, paste0("Mapped column(s) not found in the file: ", paste(missing, collapse=", "), "."))
+      if (length(unique(mapped)) < 3)
+        errors <- c(errors, "The ENV, GEN and REP drop-downs must each point to a DIFFERENT column. Please fix the column mapping.")
+      if (length(errors) > 0) {
+        met_valmsg(show_validation_msgs(list(errors=errors, warnings=character(0))))
+        return()
+      }
       names(df)[names(df)==input$env_col] <- "ENV"
       names(df)[names(df)==input$gen_col] <- "GEN"
       names(df)[names(df)==input$rep_col] <- "REP"
+      resp_cols <- setdiff(names(df), c("ENV","GEN","REP"))
+      v <- validate_breeding_data(df, list(GEN="GEN", REP="REP", ENV="ENV"), resp_cols, require_reps=TRUE)
+      # environment check
+      if (length(unique(trimws(as.character(df$ENV)))) < 2)
+        v$warnings <- c(v$warnings, "Only one environment was detected. MET, AMMI, GGE and stability analyses need 2 or more environments.")
+      if (!v$ok) {
+        met_valmsg(show_validation_msgs(list(errors=v$errors, warnings=v$warnings)))
+        return()
+      }
       df$ENV <- factor(df$ENV, levels=unique(df$ENV))
       df$GEN <- factor(df$GEN, levels=unique(df$GEN))
       df$REP <- factor(df$REP, levels=unique(df$REP))
-      resp_cols <- setdiff(names(df), c("ENV","GEN","REP"))
       for (col in resp_cols) df[[col]] <- suppressWarnings(as.numeric(df[[col]]))
       processed_data(df)
-      showNotification("✅ MET data loaded!", type="message", duration=3)
+      met_valmsg(show_validation_msgs(list(errors=character(0), warnings=v$warnings)))
+      if (length(v$warnings) > 0)
+        showNotification("\u2705 MET data loaded with warnings \u2014 review the notes above.", type="warning", duration=6)
+      else
+        showNotification("\u2705 MET data loaded and validated!", type="message", duration=3)
     })
 
     resp_vars <- reactive({ req(processed_data()); setdiff(names(processed_data()), c("ENV","GEN","REP")) })
@@ -1360,6 +1594,7 @@ mtUI <- function(id) {
           actionButton(ns("btn_load"),"⚙️  Process Data",class="btn-success btn-block",icon=icon("play"))
         ),
         box(title="Trait Goals Configuration",width=5,status="success",solidHeader=TRUE,
+          uiOutput(ns("val_alert_mt")),
           p(style="color:#555;font-size:12px;","Select whether higher or lower values are desired for each trait."),
           uiOutput(ns("ui_trait_goals")), br(), uiOutput(ns("value_boxes"))
         ),
@@ -1596,11 +1831,19 @@ mtServer <- function(id) {
     gamem_r        <- reactiveVal(NULL)
     waasb_r        <- reactiveVal(NULL)
 
+    mt_valmsg <- reactiveVal(NULL)
+    output$val_alert_mt <- renderUI({ mt_valmsg() })
+
     observeEvent(input$file1, {
+      mt_valmsg(NULL)
       req(input$file1)
-      df <- tryCatch(read.csv(input$file1$datapath,fileEncoding="UTF-8-BOM",stringsAsFactors=FALSE),
-                     error=function(e){ showNotification(paste("❌ File error:",e$message),type="error"); NULL })
-      raw_data(df)
+      r <- safe_read_file(input$file1$datapath, input$file1$name, csv_only=TRUE)
+      if (!r$ok) {
+        mt_valmsg(show_validation_msgs(list(errors=r$msg, warnings=character(0))))
+        raw_data(NULL); processed_data(NULL)
+        return()
+      }
+      raw_data(r$data)
     })
     observe({
       req(raw_data()); cols <- names(raw_data())
@@ -1629,18 +1872,47 @@ mtServer <- function(id) {
     })
     selected_traits_r <- reactive({ req(numeric_trait_cols()); numeric_trait_cols() })
     observeEvent(input$btn_load, {
+      mt_valmsg(NULL); processed_data(NULL)
       req(raw_data(),input$env_col,input$gen_col,input$rep_col)
       df <- raw_data()
+      errors <- character(0)
+      mapped <- c(ENV=input$env_col, GEN=input$gen_col, REP=input$rep_col)
+      missing <- mapped[!mapped %in% names(df)]
+      if (length(missing) > 0)
+        errors <- c(errors, paste0("Mapped column(s) not found in the file: ", paste(missing, collapse=", "), "."))
+      if (length(unique(mapped)) < 3)
+        errors <- c(errors, "The ENV, GEN and REP drop-downs must each point to a DIFFERENT column. Please fix the column mapping.")
+      trs <- selected_traits_r()
+      if (length(trs) == 0)
+        errors <- c(errors, "No numeric trait columns were detected besides ENV/GEN/REP. The file needs at least one trait column of numbers.")
+      if (length(errors) > 0) {
+        mt_valmsg(show_validation_msgs(list(errors=errors, warnings=character(0))))
+        return()
+      }
       names(df)[names(df)==input$env_col] <- "ENV"
       names(df)[names(df)==input$gen_col] <- "GEN"
       names(df)[names(df)==input$rep_col] <- "REP"
+      v <- validate_breeding_data(df, list(GEN="GEN", REP="REP", ENV="ENV"), trs, require_reps=TRUE)
+      if (length(unique(trimws(as.character(df$ENV)))) < 2)
+        v$warnings <- c(v$warnings, "Only one environment was detected. Multi-trait MET models (gamem_met/waasb) need 2 or more environments.")
+      # selection intensity sanity
+      si <- suppressWarnings(as.numeric(input$sel_intensity))
+      if (is.na(si) || si < 1 || si > 50)
+        v$warnings <- c(v$warnings, "Selection Intensity should be between 1% and 50%. Please set a sensible value (15% is typical).")
+      if (!v$ok) {
+        mt_valmsg(show_validation_msgs(list(errors=v$errors, warnings=v$warnings)))
+        return()
+      }
       df$ENV <- factor(df$ENV,levels=unique(df$ENV))
       df$GEN <- factor(df$GEN,levels=unique(df$GEN))
       df$REP <- factor(df$REP,levels=unique(df$REP))
-      trs <- selected_traits_r()
       for (tr in trs) if(tr %in% names(df)) df[[tr]] <- suppressWarnings(as.numeric(df[[tr]]))
       processed_data(df)
-      showNotification("✅ MT data processed!",type="message",duration=3)
+      mt_valmsg(show_validation_msgs(list(errors=character(0), warnings=v$warnings)))
+      if (length(v$warnings) > 0)
+        showNotification("\u2705 MT data processed with warnings \u2014 review the notes above.", type="warning", duration=6)
+      else
+        showNotification("\u2705 MT data processed and validated!",type="message",duration=3)
     })
     output$value_boxes <- renderUI({ req(processed_data()); df<-processed_data(); trs<-selected_traits_r()
       fluidRow(valueBox(nlevels(df$ENV),"Environments",icon=icon("leaf"),color="green",width=3),valueBox(nlevels(df$GEN),"Genotypes",icon=icon("seedling"),color="teal",width=3),valueBox(nlevels(df$REP),"Replications",icon=icon("clone"),color="orange",width=3),valueBox(length(trs),"Traits",icon=icon("dna"),color="purple",width=3)) })
