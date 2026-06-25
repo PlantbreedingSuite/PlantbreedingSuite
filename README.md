@@ -150,8 +150,9 @@ PlantBreedingSuite/
 │   └── DWR_genotype_means.csv     # D² genotype means (36G × 11 traits)
 │
 ├── docs/
-│   ├── USER_GUIDE.md              # Detailed step-by-step usage guide
-│   └── screenshots/               # App screenshots
+│   ├── USER_GUIDE.md                                # Detailed step-by-step usage guide
+│   ├── PlantBreedingSuite_User_Manual.pdf           # App user manual
+│   └── screenshots/                                 # App screenshots
 │
 ├── README.md                      # This file
 ├── LICENSE                        # MIT License
