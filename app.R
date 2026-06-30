@@ -15,7 +15,8 @@ pkgs <- c(
   "ggplot2","dplyr","tidyverse","readxl","writexl","reshape2",
   "RColorBrewer","ggrepel","scales","viridis","factoextra","FactoMineR",
   "Hmisc","shinycssloaders","biotools","ggdendro","dendextend",
-  "metan","corrplot","ggforce","patchwork","tibble","purrr","fmsb","grDevices"
+  "metan","corrplot","ggforce","patchwork","tibble","purrr","fmsb","grDevices",
+  "lme4","lmerTest","emmeans","cluster","zip"
 )
 new_pkg <- pkgs[!pkgs %in% rownames(installed.packages())]
 if (length(new_pkg)) install.packages(new_pkg, dependencies = TRUE)
@@ -64,7 +65,28 @@ metan_df  <- function(obj, var_name=NULL) {
   if (is.null(obj)) return(data.frame(Info="No data"))
   x <- obj
   if (!is.null(var_name) && is.list(obj) && !is.data.frame(obj) && var_name %in% names(obj)) x <- obj[[var_name]]
-  if (is.list(x) && !is.data.frame(x) && length(x)>0) x <- x[["general"]] %||% x[[1]]
+  if (is.list(x) && !is.data.frame(x) && length(x)>0) {
+    # Different metan functions store their per-genotype summary table
+    # under different list-element names: ge_stats()/ecovalence()/
+    # Shukla() use "general", but superiority()/Fox() use "index" (their
+    # "general"/other elements hold environment-classification metadata,
+    # not genotype results). Blindly taking x[["general"]] %||% x[[1]]
+    # silently picked the WRONG sub-table for those functions, which is
+    # why the Superiority Plot was drawing from incorrect data. Instead,
+    # actively search for the element that is itself a per-genotype
+    # data.frame/tibble (i.e. has a "GEN" column), trying the common
+    # names first and then scanning every element as a fallback.
+    is_gen_df <- function(e) is.data.frame(e) && any(grepl("^gen$", names(e), ignore.case=TRUE))
+    pick <- NULL
+    for (nm in c("index","general","data","model","stats")) {
+      if (!is.null(x[[nm]]) && is_gen_df(x[[nm]])) { pick <- x[[nm]]; break }
+    }
+    if (is.null(pick)) {
+      df_elems <- Filter(is_gen_df, x)
+      if (length(df_elems) > 0) pick <- df_elems[[1]]
+    }
+    x <- pick %||% (x[["general"]] %||% x[[1]])
+  }
   if (is.null(x)) return(data.frame(Info="No data returned"))
   tryCatch(data.frame(as.list(x), check.names=FALSE, stringsAsFactors=FALSE),
            error=function(e) tryCatch(as.data.frame(x), error=function(e2) data.frame(Error=e2$message)))
@@ -73,6 +95,33 @@ dl_bar <- function(btn_id, label="⬇  Download HD PDF") {
   div(style="background:#F7FBF8;border:1px solid #D8EDE1;border-radius:8px;padding:7px 12px;margin-bottom:10px;display:flex;align-items:center;gap:10px;",
       span(style="font-size:12px;color:#2D6A4F;font-weight:700;","Export:"),
       downloadButton(btn_id, label, class="btn-primary btn-sm"))
+}
+
+# build_zip_export() — generic "Download All (ZIP)" engine shared by all
+# three modules. `items` is a named list of list(filename=<string>,
+# write=function(path){...}); each writer is tried independently with
+# tryCatch so that ONE analysis that hasn't been run yet (or that fails)
+# never blocks the others from being bundled — the zip always contains
+# whichever results actually exist at the moment the button is clicked,
+# i.e. it reflects the analyses the user has actually carried out rather
+# than a fixed default set.
+build_zip_export <- function(items, zipfile) {
+  tmpdir <- tempfile("export_"); dir.create(tmpdir)
+  files <- character(0)
+  for (nm in names(items)) {
+    it <- items[[nm]]
+    fp <- file.path(tmpdir, it$filename)
+    ok <- tryCatch({ it$write(fp); TRUE }, error=function(e) FALSE)
+    if (ok && file.exists(fp)) files <- c(files, it$filename)
+  }
+  if (length(files) == 0) {
+    writeLines("No analyses have been run yet in this session. Run at least one analysis, then use Download All (ZIP) again.",
+               file.path(tmpdir, "README.txt"))
+    files <- "README.txt"
+  }
+  old_wd <- setwd(tmpdir)
+  on.exit({ setwd(old_wd); unlink(tmpdir, recursive=TRUE) }, add=TRUE)
+  zip::zip(zipfile, files = files)
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -85,8 +134,8 @@ safe_read_file <- function(path, name, csv_only=FALSE) {
   allowed <- if (csv_only) "csv" else c("csv","xlsx","xls")
   if (!ext %in% allowed)
     return(list(ok=FALSE, data=NULL,
-      msg=paste0("Unsupported file type \u201C.", ext, "\u201D. Please upload a ",
-                 if (csv_only) "CSV (.csv) file." else "CSV or Excel (.csv / .xlsx / .xls) file.")))
+                msg=paste0("Unsupported file type \u201C.", ext, "\u201D. Please upload a ",
+                           if (csv_only) "CSV (.csv) file." else "CSV or Excel (.csv / .xlsx / .xls) file.")))
   df <- tryCatch({
     if (ext == "csv") {
       d <- read.csv(path, fileEncoding="UTF-8-BOM", stringsAsFactors=FALSE, check.names=FALSE)
@@ -98,7 +147,7 @@ safe_read_file <- function(path, name, csv_only=FALSE) {
   }, error=function(e) e)
   if (inherits(df, "error"))
     return(list(ok=FALSE, data=NULL,
-      msg=paste0("The file could not be read. It may be open in another program, corrupted, or not a real spreadsheet. Details: ", conditionMessage(df))))
+                msg=paste0("The file could not be read. It may be open in another program, corrupted, or not a real spreadsheet. Details: ", conditionMessage(df))))
   if (is.null(df) || !is.data.frame(df) || nrow(df) == 0 || ncol(df) == 0)
     return(list(ok=FALSE, data=NULL, msg="The file appears to be empty. Please check that it contains a header row and data."))
   # Blank / duplicated column names
@@ -107,8 +156,8 @@ safe_read_file <- function(path, name, csv_only=FALSE) {
     return(list(ok=FALSE, data=NULL, msg="One or more columns have no name in the header row. Please give every column a short name (no blank headers)."))
   if (any(duplicated(nm)))
     return(list(ok=FALSE, data=NULL,
-      msg=paste0("Duplicate column name(s): ", paste(unique(nm[duplicated(nm)]), collapse=", "),
-                 ". Each column must have a unique name.")))
+                msg=paste0("Duplicate column name(s): ", paste(unique(nm[duplicated(nm)]), collapse=", "),
+                           ". Each column must have a unique name.")))
   list(ok=TRUE, data=df, msg=NULL)
 }
 
@@ -149,7 +198,7 @@ validate_breeding_data <- function(df, id_cols, trait_cols, require_reps=TRUE) {
     if (n_miss > 0) {
       pct <- round(100 * n_miss / (nrow(trait_df) * ncol(trait_df)), 1)
       warnings <- c(warnings, paste0(n_miss, " missing value(s) (", pct,
-        "%) detected in trait columns. Rows with missing data may be dropped or cause some analyses to error. Fill the gaps where possible."))
+                                     "%) detected in trait columns. Rows with missing data may be dropped or cause some analyses to error. Fill the gaps where possible."))
     }
   }
   # 4. Genotype checks
@@ -164,9 +213,9 @@ validate_breeding_data <- function(df, id_cols, trait_cols, require_reps=TRUE) {
     dupset <- names(by_canon)[by_canon > 1]
     if (length(dupset) > 0) {
       examples <- unique(unlist(lapply(dupset[seq_len(min(3, length(dupset)))],
-        function(k) unique(gens_trim[canon == k]))))
+                                       function(k) unique(gens_trim[canon == k]))))
       warnings <- c(warnings, paste0("Genotype names look inconsistent (differ only by spaces/capitals), so they may be counted as separate genotypes: ",
-        paste(head(examples, 6), collapse=", "), ". Make each name spelled identically."))
+                                     paste(head(examples, 6), collapse=", "), ". Make each name spelled identically."))
     }
     if (length(unique(gens_trim)) < 2)
       errors <- c(errors, "Only one genotype was detected. At least two genotypes are needed for comparison.")
@@ -181,7 +230,55 @@ validate_breeding_data <- function(df, id_cols, trait_cols, require_reps=TRUE) {
   list(ok = length(errors) == 0, errors = errors, warnings = warnings)
 }
 
-# Renders validation messages: fires notifications AND returns a UI alert block.
+# validate_rcbd_mapping() — checks specific to the RCBD raw-data column
+# mapping (Option 1) on top of validate_breeding_data() which already
+# screens the trait columns / genotype names / replication balance.
+# Performed BEFORE any renaming, on the raw uploaded data.frame.
+# Module 1 supports RCBD raw data only (Arithmetic Mean / BLUE / BLUP)
+# or a directly-uploaded Genotype Means table — no other experimental
+# designs are implemented.
+validate_rcbd_mapping <- function(df, gen, rep, traits) {
+  errors <- character(0); warnings <- character(0)
+  
+  # Duplicated column names in the uploaded file itself
+  dupnames <- unique(names(df)[duplicated(names(df))])
+  if (length(dupnames) > 0)
+    errors <- c(errors, paste0("The uploaded file has duplicated column names: ", paste(dupnames, collapse=", "), "."))
+  
+  # Empty columns (entirely blank/NA)
+  empty_cols <- names(df)[sapply(df, function(c) all(is.na(c) | trimws(as.character(c))==""))]
+  if (length(empty_cols) > 0)
+    warnings <- c(warnings, paste0("These columns are completely empty and will be ignored: ", paste(empty_cols, collapse=", "), "."))
+  
+  # Incorrect / missing column mapping
+  needed <- c(GEN=gen, REP=rep)
+  for (i in seq_along(needed)) {
+    if (is.null(needed[i]) || is.na(needed[i]) || !nzchar(needed[i]))
+      errors <- c(errors, paste0("Please map the required \u201C", names(needed)[i], "\u201D column."))
+    else if (!(needed[i] %in% names(df)))
+      errors <- c(errors, paste0("Mapped column \u201C", needed[i], "\u201D for ", names(needed)[i], " was not found in the uploaded file."))
+  }
+  if (length(traits) == 0)
+    errors <- c(errors, "Please select at least one Trait column.")
+  role_cols <- unname(needed[nzchar(needed) & !is.na(needed)])
+  overlap <- intersect(role_cols, traits)
+  if (length(overlap) > 0)
+    errors <- c(errors, paste0("The same column cannot be used both as an identifier (GEN/REP) and as a Trait column: ", paste(overlap, collapse=", "), "."))
+  if (length(unique(role_cols)) < length(role_cols))
+    errors <- c(errors, "GEN and REP have been mapped to the same column. Each role must use a distinct column.")
+  if (length(errors) > 0) return(list(ok=FALSE, errors=errors, warnings=warnings))
+  
+  # Duplicated rows — exact duplicate GEN+REP combinations
+  key <- paste(df[[gen]], df[[rep]], sep="||")
+  if (any(duplicated(key)))
+    warnings <- c(warnings, paste0(sum(duplicated(key)), " row(s) share an identical GEN+REP combination \u2014 check for accidental duplicate entries."))
+  
+  # Missing REP values
+  if (any(is.na(df[[rep]]) | trimws(as.character(df[[rep]]))==""))
+    errors <- c(errors, paste0("The Replication column \u201C", rep, "\u201D has missing values \u2014 every row needs a replication."))
+  
+  list(ok = length(errors) == 0, errors = errors, warnings = warnings)
+}
 show_validation_msgs <- function(v, context="data") {
   for (e in v$errors)   showNotification(paste0("\u274C ", e), type="error",   duration=12)
   for (w in v$warnings) showNotification(paste0("\u26A0\uFE0F ", w), type="warning", duration=12)
@@ -190,8 +287,8 @@ show_validation_msgs <- function(v, context="data") {
     div(style=paste0("background:",bg,";border-left:4px solid ",col,";border-radius:6px;padding:8px 12px;margin-bottom:6px;font-size:12.5px;color:#222;"),
         span(style=paste0("font-weight:700;color:",col,";"), icon, " "), t))
   div(style="margin-bottom:12px;",
-    mk(v$errors,   "#C62828", "#FDEBEC", "\u274C Error:"),
-    mk(v$warnings, "#E65100", "#FFF6E5", "\u26A0\uFE0F Warning:"))
+      mk(v$errors,   "#C62828", "#FDEBEC", "\u274C Error:"),
+      mk(v$warnings, "#E65100", "#FFF6E5", "\u26A0\uFE0F Warning:"))
 }
 
 # ════════════════════════════════════════════════════════════════
@@ -315,10 +412,49 @@ d2_build_biplot <- function(pca_res, eig_val) {
     theme_met()
 }
 
-d2_build_network <- function(toc, n_clust, pal) {
+# d2_cluster_distance_summary() — generic inter/intra cluster Mahalanobis
+# D² distance summary, computed directly from the genotype x genotype
+# distance matrix and ANY cluster-membership vector (Tocher's own
+# clusters, or a Ward/other-linkage dendrogram cut at a chosen k).
+# Diagonal = mean pairwise distance within a cluster (0 if singleton);
+# off-diagonal = mean pairwise distance between the two clusters.
+# This lets the Network Distance Plot and the Inter/Intra-cluster
+# Distances table follow whichever clustering method is currently
+# driving the dendrogram, instead of always being tied to Tocher.
+d2_cluster_distance_summary <- function(dm, cluster_vec) {
+  dm <- as.matrix(dm)
+  cl <- cluster_vec[rownames(dm)]
+  k  <- sort(unique(cl))
+  nk <- length(k)
+  out <- matrix(NA_real_, nk, nk, dimnames=list(paste0("C",seq_len(nk)), paste0("C",seq_len(nk))))
+  for (i in seq_len(nk)) {
+    idx_i <- which(cl == k[i])
+    for (j in i:nk) {
+      idx_j <- which(cl == k[j])
+      if (i == j) {
+        out[i,j] <- if (length(idx_i) > 1) { sub <- dm[idx_i, idx_i, drop=FALSE]; mean(sub[upper.tri(sub)]) } else 0
+      } else {
+        out[i,j] <- out[j,i] <- mean(dm[idx_i, idx_j, drop=FALSE])
+      }
+    }
+  }
+  out
+}
+
+# d2_hc_cut_membership() — cuts a hierarchical clustering of the D²
+# distance matrix at k clusters using the given linkage method, and
+# returns a genotype-named membership vector (mirrors what Tocher's
+# own membership vector looks like, so both can feed the same
+# downstream distance/plot functions).
+d2_hc_cut_membership <- function(dm, k, method="ward.D2") {
+  hc <- hclust(as.dist(dm), method=method)
+  cutree(hc, k=k)
+}
+
+d2_build_network <- function(dist_m, n_clust, pal, label="Tocher Clusters") {
   nc     <- n_clust; theta <- seq(pi/2, pi/2+2*pi*(1-1/nc), length.out=nc)
   node_x <- cos(theta); node_y <- sin(theta)
-  dist_m <- as.matrix(toc$distClust); intra <- diag(dist_m)
+  dist_m <- as.matrix(dist_m); intra <- diag(dist_m)
   edges <- data.frame()
   for (i in seq_len(nc-1)) for (j in (i+1):nc)
     edges <- rbind(edges, data.frame(x_from=node_x[i],y_from=node_y[i],x_to=node_x[j],y_to=node_y[j],
@@ -337,19 +473,19 @@ d2_build_network <- function(toc, n_clust, pal) {
     geom_label(data=nodes, aes(x=lx,y=ly,label=paste0("C",cluster,"\n",intra)), size=2.8,
                fill=nodes$color, colour="white", fontface="bold", label.padding=unit(.2,"lines"), label.size=0) +
     coord_equal(xlim=c(-1.6,1.6), ylim=c(-1.6,1.6)) +
-    labs(title=paste0("Inter/Intra-cluster Distances — ",nc," Tocher Clusters"),
+    labs(title=paste0("Inter/Intra-cluster Distances — ",nc," ",label),
          caption="Node: Cluster / Intra dist  •  Edge: Inter-cluster distance")
 }
 
-d2_draw_dendro <- function(dm, n_clust, pal) {
-  hc <- hclust(as.dist(dm), method="ward.D2")
+d2_draw_dendro <- function(dm, n_clust, pal, method="ward.D2") {
+  hc <- hclust(as.dist(dm), method=method)
   dend <- as.dendrogram(hc) %>%
     dendextend::color_branches(k=n_clust, col=pal) %>%
     dendextend::color_labels(k=n_clust, col=pal) %>%
     dendextend::set("labels_cex", .72) %>%
     dendextend::set("branches_lwd", 2)
   par(bg="white", mar=c(6,5,4,2))
-  plot(dend, main="Cluster Dendrogram — Ward's D² Linkage", ylab="Height (D² distance)", cex.main=1.2)
+  plot(dend, main=paste0("Cluster Dendrogram — ", method, " Linkage"), ylab="Height (distance)", cex.main=1.2)
   dendextend::rect.dendrogram(dend, k=n_clust, border=pal, lty=2, lwd=1.8)
   legend("topright", legend=paste("Cluster",seq_len(n_clust)), fill=pal, border=NA, bty="n", cex=.7,
          title=expression(bold("Clusters")))
@@ -361,9 +497,9 @@ d2_build_corr_heatmap <- function(cor_mat, p_mat, palette) {
   df$sig   <- reshape2::melt(sig)$value
   df$label <- paste0(round(df$r,2), df$sig)
   cs <- switch(palette,
-    rwb    = scale_fill_gradient2(low="#053061", mid="white", high="#67001f", midpoint=0, limits=c(-1,1), name="r"),
-    pastel = scale_fill_gradient2(low="#A6CEE3", mid="white", high="#FB9A99", midpoint=0, limits=c(-1,1), name="r"),
-    viridis= scale_fill_viridis_c(option="viridis", limits=c(-1,1), name="r"))
+               rwb    = scale_fill_gradient2(low="#053061", mid="white", high="#67001f", midpoint=0, limits=c(-1,1), name="r"),
+               pastel = scale_fill_gradient2(low="#A6CEE3", mid="white", high="#FB9A99", midpoint=0, limits=c(-1,1), name="r"),
+               viridis= scale_fill_viridis_c(option="viridis", limits=c(-1,1), name="r"))
   ggplot(df, aes(x=Trait2, y=Trait1, fill=r)) +
     geom_tile(colour="white", linewidth=.3) +
     geom_text(aes(label=label), size=2.8, colour="grey30") + cs +
@@ -373,6 +509,153 @@ d2_build_corr_heatmap <- function(cor_mat, p_mat, palette) {
 }
 
 # ════════════════════════════════════════════════════════════════
+# estimate_genotypic_values()
+#   Estimates genotype-level values for ONE trait from RCBD raw
+#   (plot-level) data — Arithmetic Mean, BLUE, or BLUP. Module 1
+#   supports RCBD raw data only; no other experimental design is
+#   implemented. Returns a list with: genotype, value, se, varG,
+#   varE, h2, note. Called once per trait by estimate_all_traits().
+estimate_genotypic_values <- function(df, trait, method = c("mean","blue","blup"),
+                                      gen_col = "GEN", rep_col = "REP") {
+  method <- match.arg(method)
+  out <- list(genotype=character(0), value=numeric(0), se=numeric(0),
+              varG=NA_real_, varE=NA_real_, h2=NA_real_, note="")
+  
+  # ── Standardize working columns to FIXED literal names (.GEN/.REP) ──
+  # IMPORTANT: formulas must reference real data.frame column names (not
+  # expressions like d[[gen_col]]). Using expressions inside a formula
+  # breaks predict()/emmeans()/ranef() when they re-evaluate terms against
+  # newdata or the model's stored environment, causing row-count mismatch
+  # errors and empty results. Renaming up front avoids this entirely.
+  d <- df
+  d$.GEN <- factor(d[[gen_col]])
+  has_rep <- !is.null(rep_col) && rep_col %in% names(d)
+  if (!has_rep) { out$note <- "RCBD requires a mapped Replication column."; return(out) }
+  d$.REP <- factor(d[[rep_col]])
+  d$.y <- suppressWarnings(as.numeric(as.character(d[[trait]])))
+  d <- d[!is.na(d$.y), ]
+  if (nrow(d) < 3 || nlevels(droplevels(d$.GEN)) < 2) {
+    out$note <- "Not enough valid observations/genotypes for this trait."
+    return(out)
+  }
+  d$.GEN <- droplevels(d$.GEN); d$.REP <- droplevels(d$.REP)
+  
+  # ── Arithmetic mean — identical to legacy behaviour ──────────────
+  if (method == "mean") {
+    agg <- aggregate(d$.y, by=list(GEN=d$.GEN), FUN=mean, na.rm=TRUE)
+    out$genotype <- as.character(agg$GEN); out$value <- agg$x; out$se <- rep(NA_real_, nrow(agg))
+    return(out)
+  }
+  
+  # ── RCBD models (literal column names) ───────────────────────────
+  #   BLUE: Trait ~ GEN + REP   (GEN fixed, REP fixed)
+  #   BLUP: Trait ~ REP + (1|GEN)   (REP fixed, GEN random)
+  fit <- tryCatch({
+    if (method == "blue") lm(.y ~ .GEN + .REP, data=d)
+    else lme4::lmer(.y ~ .REP + (1|.GEN), data=d, REML=TRUE)
+  }, error=function(e) e)
+  if (inherits(fit, "error")) { out$note <- conditionMessage(fit); return(out) }
+  
+  if (method == "blue") {
+    gl <- levels(d$.GEN)
+    pr <- tryCatch({
+      em <- emmeans::emmeans(fit, specs = ".GEN")
+      as.data.frame(em)
+    }, error=function(e) NULL)
+    if (!is.null(pr) && nrow(pr) == length(gl)) {
+      ord <- match(gl, as.character(pr$.GEN))
+      out$genotype <- gl; out$value <- pr$emmean[ord]; out$se <- pr$SE[ord]
+    } else {
+      # Fallback: manual least-squares means via predict() at the reference REP level
+      nd <- data.frame(.GEN = factor(gl, levels=gl))
+      nd$.REP <- factor(levels(d$.REP)[1], levels=levels(d$.REP))
+      pred <- tryCatch(predict(fit, newdata=nd, se.fit=TRUE), error=function(e) NULL)
+      if (!is.null(pred)) { out$genotype <- gl; out$value <- unname(pred$fit); out$se <- unname(pred$se.fit) }
+      else { out$genotype <- gl; out$value <- rep(NA_real_, length(gl)); out$se <- rep(NA_real_, length(gl)) }
+    }
+    out$varE <- tryCatch(stats::sigma(fit)^2, error=function(e) NA_real_)
+  } else { # BLUP
+    vc    <- as.data.frame(lme4::VarCorr(fit))
+    out$varG <- vc$vcov[vc$grp == ".GEN"][1] %||% NA_real_
+    out$varE <- vc$vcov[vc$grp == "Residual"][1] %||% NA_real_
+    relist <- lme4::ranef(fit, condVar=TRUE)
+    re  <- relist[[".GEN"]]
+    pv  <- attr(re, "postVar")
+    gl  <- rownames(re)
+    se  <- if (!is.null(pv)) sqrt(vapply(seq_len(dim(pv)[3]), function(i) pv[1,1,i], numeric(1))) else rep(NA_real_, length(gl))
+    mu  <- unname(lme4::fixef(fit)["(Intercept)"])
+    out$genotype <- gl; out$value <- mu + re[[1]]; out$se <- se
+    nrep <- mean(table(d$.GEN))
+    if (!is.na(out$varG) && !is.na(out$varE) && nrep > 0)
+      out$h2 <- out$varG / (out$varG + out$varE/nrep)
+  }
+  out
+}
+
+# estimate_all_traits() — loops estimate_genotypic_values() over every
+# trait and assembles (1) a "wide" GEN x trait table that becomes
+# rv$data2 (the sole input downstream analyses ever see), and (2) a
+# "detail" long table with SE / variance components / heritability for
+# the "Estimated / Direct Genotypic Values" output tab.
+estimate_all_traits <- function(df, traits, method, gen_col="GEN", rep_col="REP") {
+  results <- lapply(traits, function(tr)
+    tryCatch(estimate_genotypic_values(df, tr, method, gen_col, rep_col),
+             error=function(e) list(genotype=character(0), value=numeric(0), se=numeric(0),
+                                    varG=NA_real_, varE=NA_real_, h2=NA_real_, note=conditionMessage(e))))
+  names(results) <- traits
+  base_gen <- sort(unique(unlist(lapply(results, function(r) r$genotype))))
+  wide <- data.frame(GEN = base_gen, stringsAsFactors = FALSE)
+  for (tr in traits) {
+    r <- results[[tr]]
+    wide[[tr]] <- r$value[match(wide$GEN, r$genotype)]
+  }
+  detail <- do.call(rbind, lapply(traits, function(tr) {
+    r <- results[[tr]]
+    if (length(r$genotype) == 0) return(NULL)
+    data.frame(Trait=tr, Genotype=r$genotype, Estimate=round(r$value,4),
+               SE=round(r$se,4), Genotypic_Variance=round(r$varG,4),
+               Residual_Variance=round(r$varE,4), Heritability=round(r$h2,4),
+               stringsAsFactors=FALSE)
+  }))
+  list(wide=wide, detail=detail, results=results)
+}
+
+# ════════════════════════════════════════════════════════════════
+#  FEATURE 2 — AUTOMATIC CLUSTER-NUMBER SELECTION
+# ════════════════════════════════════════════════════════════════
+# d2_optimal_k() returns list(k=<integer>, plot=<ggplot>) for the
+# requested method, computed on the (scaled) genotype-means matrix.
+d2_optimal_k <- function(mat, method = c("elbow","silhouette","gap"), kmax = 10) {
+  method <- match.arg(method)
+  kmax <- max(2, min(kmax, nrow(mat) - 1))
+  if (method == "silhouette") {
+    p <- factoextra::fviz_nbclust(mat, kmeans, method="silhouette", k.max=kmax) + theme_met()
+    dd <- p$data
+    k  <- as.integer(as.character(dd$clusters[which.max(dd$y)]))
+  } else if (method == "elbow") {
+    p <- factoextra::fviz_nbclust(mat, kmeans, method="wss", k.max=kmax) + theme_met()
+    dd <- p$data
+    x  <- as.numeric(as.character(dd$clusters)); y <- dd$y
+    x1<-x[1]; y1<-y[1]; x2<-x[length(x)]; y2<-y[length(y)]
+    denom <- sqrt((y2-y1)^2+(x2-x1)^2)
+    pdist <- if (denom>0) abs((y2-y1)*x - (x2-x1)*y + x2*y1 - y2*x1)/denom else rep(0,length(x))
+    k <- x[which.max(pdist)]
+  } else {
+    gap <- cluster::clusGap(mat, FUN=kmeans, K.max=kmax, B=50)
+    k   <- cluster::maxSE(gap$Tab[,"gap"], gap$Tab[,"SE.sim"])
+    p   <- factoextra::fviz_gap_stat(gap) + theme_met()
+  }
+  list(k=max(2,as.integer(k)), plot=p)
+}
+
+# d2_method_choices() — single source of truth for which estimation
+# methods are valid for a given experimental design (Step 5 UI +
+# estimate_genotypic_values() validation both consult this).
+# d2_method_choices() — Module 1 supports RCBD raw data only, so all
+# three genotypic-value estimation methods are always available.
+d2_method_choices <- function() c("Arithmetic Mean"="mean","BLUE"="blue","BLUP"="blup")
+
+# ════════════════════════════════════════════════════════════════
 #  D² MODULE — UI
 # ════════════════════════════════════════════════════════════════
 d2UI <- function(id) {
@@ -380,178 +663,250 @@ d2UI <- function(id) {
   tagList(
     # ── Upload ──────────────────────────────────────────────
     tabItem("d2_upload",
-      div(class="sec-bar","📁 D² — Data Upload"),
-      fluidRow(
-        box(title="Upload Files", width=5, status="success", solidHeader=TRUE,
-          div(class="d2-alert","Raw data requires columns: REP, GEN, then traits"),
-          fileInput(ns("file1"), "Raw Data (CSV or Excel)", accept=c(".csv",".xlsx",".xls")),
-          hr(),
-          div(class="d2-alert","Genotype means requires columns: GEN, then traits"),
-          fileInput(ns("file2"), "Genotype Means (CSV or Excel)", accept=c(".csv",".xlsx",".xls")),
-          hr(),
-          numericInput(ns("trait_start"), "Trait start column (in raw data)", 3, 1, 20),
-          actionButton(ns("btn_load"), "▶  Load & Validate Data", class="btn-success btn-block", icon=icon("play"))
-        ),
-        box(title="Data Preview", width=7, status="success", solidHeader=TRUE,
-          uiOutput(ns("val_alert")),
-          uiOutput(ns("data_stats")), br(),
-          h5("Raw Data (first 10 rows)", style="color:#2D6A4F;font-weight:700;"),
-          withSpinner(DTOutput(ns("preview1")), color="#56d364"),
-          br(),
-          h5("Genotype Means (first 10 rows)", style="color:#2D6A4F;font-weight:700;"),
-          withSpinner(DTOutput(ns("preview2")), color="#56d364")
-        )
-      )
+            div(class="sec-bar","📁 D² — Data Upload & Setup"),
+            fluidRow(
+              box(title="Choose Input Option", width=12, status="success", solidHeader=TRUE,
+                  radioButtons(ns("input_option"), NULL,
+                               choices = c("Option 1 \u2014 RCBD Replicated Raw Data (GEN + REP + Traits)" = "raw",
+                                           "Option 2 \u2014 Genotype Means already calculated (GEN + Traits)" = "means"),
+                               selected = "raw"),
+                  helpText("Module 1 supports Randomized Complete Block Design (RCBD) raw data only. ",
+                           "If you already have genotype-level means, use Option 2 to skip model fitting entirely.")
+              )
+            ),
+            # ── OPTION 1: RCBD raw data ─────────────────────────────
+            conditionalPanel(condition = sprintf("input['%s'] == 'raw'", ns("input_option")),
+                             fluidRow(
+                               box(title="Upload RCBD Raw Dataset", width=12, status="success", solidHeader=TRUE,
+                                   fileInput(ns("file1"), "Raw Dataset (CSV or Excel)", accept=c(".csv",".xlsx",".xls")),
+                                   uiOutput(ns("colmap_ui"))
+                               )
+                             ),
+                             fluidRow(
+                               box(title="Validate Dataset", width=12, status="success", solidHeader=TRUE,
+                                   actionButton(ns("btn_validate"), "▶  Validate Data", class="btn-success", icon=icon("check")),
+                                   br(), br(),
+                                   uiOutput(ns("val_alert")),
+                                   uiOutput(ns("data_stats"))
+                               )
+                             ),
+                             fluidRow(
+                               box(title="Data Preview", width=12, status="success", solidHeader=TRUE,
+                                   h5("Raw Data (first 10 rows)", style="color:#2D6A4F;font-weight:700;"),
+                                   withSpinner(DTOutput(ns("preview1")), color="#56d364")
+                               )
+                             ),
+                             uiOutput(ns("genoval_ui"))
+            ),
+            # ── OPTION 2: directly-uploaded genotype means ───────────
+            conditionalPanel(condition = sprintf("input['%s'] == 'means'", ns("input_option")),
+                             fluidRow(
+                               box(title="Upload Genotype Means Dataset", width=12, status="success", solidHeader=TRUE,
+                                   div(class="d2-alert","No REP column required \u2014 one row per genotype. Model fitting is skipped; these values are used directly."),
+                                   fileInput(ns("file_means"), "Genotype Means (CSV or Excel)", accept=c(".csv",".xlsx",".xls")),
+                                   uiOutput(ns("colmap_means_ui"))
+                               )
+                             ),
+                             fluidRow(
+                               box(title="Validate Dataset", width=12, status="success", solidHeader=TRUE,
+                                   actionButton(ns("btn_validate_means"), "▶  Validate Data", class="btn-success", icon=icon("check")),
+                                   br(), br(),
+                                   uiOutput(ns("val_alert_means")),
+                                   uiOutput(ns("data_stats_means"))
+                               )
+                             ),
+                             fluidRow(
+                               box(title="Data Preview", width=12, status="success", solidHeader=TRUE,
+                                   h5("Genotype Means (first 10 rows)", style="color:#2D6A4F;font-weight:700;"),
+                                   withSpinner(DTOutput(ns("preview_means")), color="#56d364")
+                               )
+                             )
+            )
+    ),
+    # ── Estimated / Direct Genotypic Values ───────────────────
+    tabItem("d2_genoval",
+            div(class="sec-bar","\U0001F9EE D\u00B2 — Genotypic Values Used for Analysis"),
+            fluidRow(
+              box(title="Genotype-level Values Used for Downstream Analysis", width=12, status="success", solidHeader=TRUE,
+                  uiOutput(ns("est_summary")),
+                  downloadButton(ns("dl_est_csv"), "\u2B07  Download (.csv)", class="btn-warning"), br(), br(),
+                  withSpinner(DTOutput(ns("est_tbl")), color="#52B788")
+              )
+            )
     ),
     # ── MANOVA ──────────────────────────────────────────────
     tabItem("d2_manova",
-      div(class="sec-bar","📊 D² — MANOVA"),
-      fluidRow(
-        box(title="Multivariate ANOVA", width=12, status="success", solidHeader=TRUE,
-          actionButton(ns("btn_manova"), "▶  Run MANOVA", class="btn-success", icon=icon("play")),
-          br(), br(),
-          withSpinner(verbatimTextOutput(ns("manova_out")), color="#52B788")
-        )
-      ),
-      fluidRow(
-        box(title="Univariate ANOVA per Trait", width=12, status="success", solidHeader=TRUE,
-          withSpinner(DTOutput(ns("anova_tbl")), color="#52B788")
-        )
-      )
+            div(class="sec-bar","📊 D² — MANOVA"),
+            fluidRow(
+              box(title="Multivariate ANOVA", width=12, status="success", solidHeader=TRUE,
+                  actionButton(ns("btn_manova"), "▶  Run MANOVA", class="btn-success", icon=icon("play")),
+                  br(), br(),
+                  withSpinner(verbatimTextOutput(ns("manova_out")), color="#52B788")
+              )
+            ),
+            fluidRow(
+              box(title="Univariate ANOVA per Trait", width=12, status="success", solidHeader=TRUE,
+                  uiOutput(ns("anova_tbl_dl_ui")),
+                  withSpinner(DTOutput(ns("anova_tbl")), color="#52B788")
+              )
+            )
     ),
     # ── D² Distances ────────────────────────────────────────
     tabItem("d2_d2",
-      div(class="sec-bar","📐 D² — Mahalanobis Distances"),
-      fluidRow(
-        box(title="D² Distance Matrix", width=12, status="success", solidHeader=TRUE,
-          actionButton(ns("btn_d2"), "▶  Compute D² Distances", class="btn-success", icon=icon("play")),
-          br(), br(),
-          uiOutput(ns("d2_stats")),
-          withSpinner(DTOutput(ns("d2_tbl")), color="#52B788")
-        )
-      ),
-      fluidRow(
-        box(title="D² Distance Heatmap", width=12, status="success", solidHeader=TRUE,
-          dl_bar(ns("dl_heatmap_pdf")),
-          withSpinner(plotlyOutput(ns("d2_heatmap"), height="550px"), color="#52B788")
-        )
-      )
+            div(class="sec-bar","📐 D² — Mahalanobis Distances"),
+            fluidRow(
+              box(title="D² Distance Matrix", width=12, status="success", solidHeader=TRUE,
+                  actionButton(ns("btn_d2"), "▶  Compute D² Distances", class="btn-success", icon=icon("play")),
+                  br(), br(),
+                  uiOutput(ns("d2_stats")),
+                  uiOutput(ns("d2_tbl_dl_ui")),
+                  withSpinner(DTOutput(ns("d2_tbl")), color="#52B788")
+              )
+            ),
+            fluidRow(
+              box(title="D² Distance Heatmap", width=12, status="success", solidHeader=TRUE,
+                  dl_bar(ns("dl_heatmap_pdf")),
+                  withSpinner(plotlyOutput(ns("d2_heatmap"), height="550px"), color="#52B788")
+              )
+            )
     ),
     # ── Tocher ──────────────────────────────────────────────
     tabItem("d2_tocher",
-      div(class="sec-bar","🌐 D² — Tocher Clustering"),
-      fluidRow(
-        box(title="Tocher Clustering", width=12, status="success", solidHeader=TRUE,
-          actionButton(ns("btn_tocher"), "▶  Run Tocher", class="btn-success", icon=icon("play")),
-          br(), br(), uiOutput(ns("tocher_stats"))
-        )
-      ),
-      fluidRow(
-        box(title="Cluster Membership", width=6, status="success", solidHeader=TRUE,
-          withSpinner(DTOutput(ns("tocher_mem")), color="#52B788")),
-        box(title="Inter/Intra-cluster Distances", width=6, status="success", solidHeader=TRUE,
-          withSpinner(DTOutput(ns("tocher_dist")), color="#52B788"))
-      ),
-      fluidRow(
-        box(title="Cluster Dendrogram", width=6, status="success", solidHeader=TRUE,
-          dl_bar(ns("dl_dendro_pdf")),
-          withSpinner(plotOutput(ns("dendro_plot"), height="460px"), color="#52B788")),
-        box(title="Network Distance Plot", width=6, status="success", solidHeader=TRUE,
-          dl_bar(ns("dl_network_pdf")),
-          withSpinner(plotOutput(ns("network_plot"), height="460px"), color="#52B788"))
-      ),
-      fluidRow(
-        box(title="Cluster-wise Trait Means", width=12, status="success", solidHeader=TRUE,
-          withSpinner(DTOutput(ns("cluster_means")), color="#52B788"))
-      )
+            div(class="sec-bar","🌐 D² — Tocher Clustering"),
+            fluidRow(
+              box(title="Tocher Clustering", width=12, status="success", solidHeader=TRUE,
+                  actionButton(ns("btn_tocher"), "▶  Run Tocher", class="btn-success", icon=icon("play")),
+                  br(), br(), uiOutput(ns("tocher_stats"))
+              )
+            ),
+            fluidRow(
+              box(title="Cluster Number Selection (for Ward Dendrogram)", width=12, status="success", solidHeader=TRUE,
+                  helpText("The Tocher procedure always determines its own cluster count above. The options below ",
+                           "control only how many clusters are drawn on the Ward dendrogram further down this tab."),
+                  fluidRow(
+                    column(6,
+                           radioButtons(ns("clust_k_method"), "Number of Clusters",
+                                        choices = c("Use Tocher cluster number (default)" = "tocher",
+                                                    "Automatic (Elbow Method)"             = "elbow",
+                                                    "Automatic (Silhouette)"                = "silhouette",
+                                                    "Automatic (Gap Statistic)"             = "gap",
+                                                    "User-defined"                          = "manual"),
+                                        selected = "tocher"),
+                           conditionalPanel(condition = sprintf("input['%s'] == 'manual'", ns("clust_k_method")),
+                                            numericInput(ns("manual_k"), "Number of clusters", value=3, min=2, max=20))
+                    ),
+                    column(6,
+                           selectInput(ns("hc_method"), "Hierarchical Clustering Algorithm",
+                                       choices = c("Ward.D2"="ward.D2","Complete"="complete","Average"="average",
+                                                   "Single"="single","McQuitty"="mcquitty"), selected="ward.D2"),
+                           actionButton(ns("btn_apply_k"), "▶  Apply / Recalculate k", class="btn-success", icon=icon("play"))
+                    )
+                  ),
+                  withSpinner(plotOutput(ns("optk_plot"), height="320px"), color="#52B788"),
+                  uiOutput(ns("optk_dl_ui"))
+              )
+            ),
+            fluidRow(
+              box(title="Cluster Membership", width=6, status="success", solidHeader=TRUE,
+                  uiOutput(ns("tocher_mem_dl_ui")),
+                  withSpinner(DTOutput(ns("tocher_mem")), color="#52B788")),
+              box(title="Inter/Intra-cluster Distances", width=6, status="success", solidHeader=TRUE,
+                  uiOutput(ns("tocher_dist_dl_ui")),
+                  withSpinner(DTOutput(ns("tocher_dist")), color="#52B788"))
+            ),
+            fluidRow(
+              box(title="Cluster Dendrogram", width=6, status="success", solidHeader=TRUE,
+                  dl_bar(ns("dl_dendro_pdf")),
+                  withSpinner(plotOutput(ns("dendro_plot"), height="460px"), color="#52B788")),
+              box(title="Network Distance Plot", width=6, status="success", solidHeader=TRUE,
+                  dl_bar(ns("dl_network_pdf")),
+                  withSpinner(plotOutput(ns("network_plot"), height="460px"), color="#52B788"))
+            ),
+            fluidRow(
+              box(title="Cluster-wise Trait Means", width=12, status="success", solidHeader=TRUE,
+                  uiOutput(ns("cluster_means_dl_ui")),
+                  withSpinner(DTOutput(ns("cluster_means")), color="#52B788"))
+            )
     ),
     # ── PCA ─────────────────────────────────────────────────
     tabItem("d2_pca",
-      div(class="sec-bar","📈 D² — Principal Component Analysis"),
-      fluidRow(
-        box(title="PCA", width=12, status="success", solidHeader=TRUE,
-          actionButton(ns("btn_pca"), "▶  Run PCA", class="btn-success", icon=icon("play")),
-          br(), br(), uiOutput(ns("pca_stats"))
-        )
-      ),
-      fluidRow(
-        box(title="Scree Plot", width=6, status="success", solidHeader=TRUE,
-          dl_bar(ns("dl_scree_pdf")),
-          withSpinner(plotOutput(ns("scree_plot"), height="360px"), color="#52B788")),
-        box(title="PCA Biplot — Genotypes × Traits", width=6, status="success", solidHeader=TRUE,
-          dl_bar(ns("dl_biplot_pdf")),
-          withSpinner(plotlyOutput(ns("pca_biplot"), height="360px"), color="#52B788"))
-      ),
-      fluidRow(
-        box(title="Eigenvalues Table", width=6, status="success", solidHeader=TRUE,
-          withSpinner(DTOutput(ns("eig_tbl")), color="#52B788")),
-        box(title="Variable Loadings", width=6, status="success", solidHeader=TRUE,
-          withSpinner(DTOutput(ns("loading_tbl")), color="#52B788"))
-      ),
-      fluidRow(
-        box(title="PCA with Tocher Cluster Overlay", width=12, status="success", solidHeader=TRUE,
-          dl_bar(ns("dl_pca_cluster_pdf")),
-          withSpinner(plotlyOutput(ns("pca_cluster"), height="480px"), color="#52B788"))
-      )
+            div(class="sec-bar","📈 D² — Principal Component Analysis"),
+            fluidRow(
+              box(title="PCA", width=12, status="success", solidHeader=TRUE,
+                  actionButton(ns("btn_pca"), "▶  Run PCA", class="btn-success", icon=icon("play")),
+                  br(), br(), uiOutput(ns("pca_stats"))
+              )
+            ),
+            fluidRow(
+              box(title="Scree Plot", width=6, status="success", solidHeader=TRUE,
+                  dl_bar(ns("dl_scree_pdf")),
+                  withSpinner(plotOutput(ns("scree_plot"), height="360px"), color="#52B788")),
+              box(title="PCA Biplot — Genotypes × Traits", width=6, status="success", solidHeader=TRUE,
+                  dl_bar(ns("dl_biplot_pdf")),
+                  withSpinner(plotlyOutput(ns("pca_biplot"), height="360px"), color="#52B788"))
+            ),
+            fluidRow(
+              box(title="Eigenvalues Table", width=6, status="success", solidHeader=TRUE,
+                  uiOutput(ns("eig_tbl_dl_ui")),
+                  withSpinner(DTOutput(ns("eig_tbl")), color="#52B788")),
+              box(title="Variable Loadings", width=6, status="success", solidHeader=TRUE,
+                  uiOutput(ns("loading_tbl_dl_ui")),
+                  withSpinner(DTOutput(ns("loading_tbl")), color="#52B788"))
+            ),
+            fluidRow(
+              box(title="PCA with Tocher Cluster Overlay", width=12, status="success", solidHeader=TRUE,
+                  dl_bar(ns("dl_pca_cluster_pdf")),
+                  withSpinner(plotlyOutput(ns("pca_cluster"), height="480px"), color="#52B788"))
+            )
     ),
     # ── Correlation ──────────────────────────────────────────
     tabItem("d2_corr",
-      div(class="sec-bar","🔗 D² — Correlation Analysis"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          radioButtons(ns("corr_palette"), "Colour Scheme",
-                       choices=c("Red-White-Blue"="rwb","Pastel"="pastel","Viridis"="viridis"), selected="rwb"),
-          br(),
-          actionButton(ns("btn_corr"), "▶  Compute Correlation", class="btn-success btn-block", icon=icon("play"))
-        ),
-        box(title="Pearson Correlation Heatmap", width=9, status="success", solidHeader=TRUE,
-          dl_bar(ns("dl_corr_pdf")),
-          withSpinner(plotlyOutput(ns("corr_heatmap"), height="500px"), color="#52B788")
-        )
-      ),
-      fluidRow(
-        box(title="Correlation Matrix (r values)", width=6, status="success", solidHeader=TRUE,
-          withSpinner(DTOutput(ns("corr_tbl")), color="#52B788")),
-        box(title="Significant Pairs (p ≤ 0.05)", width=6, status="success", solidHeader=TRUE,
-          withSpinner(DTOutput(ns("sig_pairs_tbl")), color="#52B788"))
-      )
+            div(class="sec-bar","🔗 D² — Correlation Analysis"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  radioButtons(ns("corr_palette"), "Colour Scheme",
+                               choices=c("Red-White-Blue"="rwb","Pastel"="pastel","Viridis"="viridis"), selected="rwb"),
+                  br(),
+                  actionButton(ns("btn_corr"), "▶  Compute Correlation", class="btn-success btn-block", icon=icon("play"))
+              ),
+              box(title="Pearson Correlation Heatmap", width=9, status="success", solidHeader=TRUE,
+                  dl_bar(ns("dl_corr_pdf")),
+                  withSpinner(plotlyOutput(ns("corr_heatmap"), height="500px"), color="#52B788")
+              )
+            ),
+            fluidRow(
+              box(title="Correlation Matrix (r values)", width=6, status="success", solidHeader=TRUE,
+                  uiOutput(ns("corr_tbl_dl_ui")),
+                  withSpinner(DTOutput(ns("corr_tbl")), color="#52B788")),
+              box(title="Significant Pairs (p ≤ 0.05)", width=6, status="success", solidHeader=TRUE,
+                  uiOutput(ns("sig_pairs_tbl_dl_ui")),
+                  withSpinner(DTOutput(ns("sig_pairs_tbl")), color="#52B788"))
+            )
     ),
     # ── Export ──────────────────────────────────────────────
     tabItem("d2_export",
-      div(class="sec-bar","📦 D² — Export Results"),
-      fluidRow(
-        box(title="Download Tables (CSV)", width=6, status="success", solidHeader=TRUE,
-          p(style="color:#555;font-size:12px;","Run all analyses first, then download."),
-          fluidRow(
-            column(6, downloadButton(ns("dl_means"),  "Genotype Means (.csv)",     class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_d2mat"),  "D² Matrix (.csv)",          class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_tocher"), "Tocher Clusters (.csv)",    class="btn-warning btn-block")),
-            column(6, downloadButton(ns("dl_corr"),   "Correlation Matrix (.csv)", class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_eig"),    "PCA Eigenvalues (.csv)",    class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_loads"),  "PCA Loadings (.csv)",       class="btn-warning btn-block"))
-          ),
-          br(),
-          fluidRow(
-            column(6, downloadButton(ns("dl_scores"),        "PCA Scores (.csv)",              class="btn-warning btn-block")),
-            column(6, downloadButton(ns("dl_anova"),         "ANOVA per Trait (.csv)",         class="btn-warning btn-block"))
-          ),
-          br(),
-          fluidRow(
-            column(6, downloadButton(ns("dl_cluster_means"), "Cluster-wise Trait Means (.csv)",    class="btn-warning btn-block")),
-            column(6, downloadButton(ns("dl_cluster_dist"),  "Inter/Intra Cluster Distances (.csv)", class="btn-warning btn-block"))
-          )
-        ),
-        box(title="Download Plots (PDF)", width=6, status="success", solidHeader=TRUE,
-          fluidRow(
-            column(6, downloadButton(ns("dl_dendro_pdf_ex"),      "Dendrogram (.pdf)",       class="btn-primary btn-block"), br(),
-                      downloadButton(ns("dl_network_pdf_ex"),     "Network Plot (.pdf)",     class="btn-primary btn-block"), br(),
-                      downloadButton(ns("dl_heatmap_pdf_ex"),     "D² Heatmap (.pdf)",       class="btn-primary btn-block")),
-            column(6, downloadButton(ns("dl_scree_pdf_ex"),       "Scree Plot (.pdf)",       class="btn-primary btn-block"), br(),
-                      downloadButton(ns("dl_biplot_pdf_ex"),      "PCA Biplot (.pdf)",       class="btn-primary btn-block"), br(),
-                      downloadButton(ns("dl_corr_pdf_ex"),        "Corr. Heatmap (.pdf)",    class="btn-primary btn-block"))
-          )
-        )
-      )
+            div(class="sec-bar","📦 D² — Export Results"),
+            fluidRow(
+              box(title="Download All (ZIP)", width=12, status="success", solidHeader=TRUE,
+                  p(style="color:#555;font-size:12px;",
+                    "Bundles every table (CSV) and plot (PDF) from the analyses you have actually run in this session \u2014 ",
+                    "nothing else is included, and nothing here is run automatically."),
+                  downloadButton(ns("dl_all_zip"), "\U0001F4E6  Download All Results (.zip)", class="btn-success", style="font-size:14px;padding:10px 18px;")
+              )
+            ),
+            fluidRow(
+              box(title="Analysis Status", width=12, status="success", solidHeader=TRUE,
+                  uiOutput(ns("export_status_ui"))
+              )
+            ),
+            fluidRow(
+              box(title="Download Tables (CSV)", width=6, status="success", solidHeader=TRUE,
+                  uiOutput(ns("export_csv_ui"))
+              ),
+              box(title="Download Plots (PDF)", width=6, status="success", solidHeader=TRUE,
+                  uiOutput(ns("export_pdf_ui"))
+              )
+            )
     )
   )
 }
@@ -565,127 +920,237 @@ d2Server <- function(id) {
                          d_dist=NULL, dm=NULL, toc=NULL, cluster_vec=NULL,
                          n_clust=NULL, pal=NULL, pca_res=NULL, eig_val=NULL,
                          cor_mat=NULL, p_mat=NULL, mod=NULL, dv=NULL,
-                         loaded=FALSE, ran_manova=FALSE, valmsg=NULL)
-
+                         loaded=FALSE, ran_manova=FALSE, ran_d2=FALSE, ran_tocher=FALSE,
+                         ran_pca=FALSE, ran_corr=FALSE, valmsg=NULL,
+                         est_out=NULL, dendro_k=NULL, dendro_pal=NULL,
+                         hc_method_used="ward.D2", optk_plot=NULL,
+                         validated=FALSE, traits=NULL,
+                         gen=NULL, rep=NULL, est_summary_txt=NULL,
+                         valmsg_means=NULL, validated_means=FALSE, traits_means=NULL)
+    
     read_f <- function(p) {
       ext <- tolower(tools::file_ext(p))
       if (ext %in% c("xlsx","xls")) readxl::read_excel(p) %>% as.data.frame() else read.csv(p, stringsAsFactors=FALSE)
     }
-
-    observeEvent(input$btn_load, {
-      rv$loaded <- FALSE; rv$valmsg <- NULL
-      if (is.null(input$file1) || is.null(input$file2)) {
-        rv$valmsg <- show_validation_msgs(list(errors=c(
-          "Please choose BOTH files before loading: the Raw Data file and the Genotype Means file."), warnings=character(0)))
-        showNotification("\u274C Both data files are required.", type="error", duration=10)
+    
+    # ════════════════════════════════════════════════════════════
+    #  OPTION 1 — RCBD raw data (GEN + REP + Traits)
+    # ════════════════════════════════════════════════════════════
+    raw_upload <- reactive({
+      req(input$file1)
+      r <- safe_read_file(input$file1$datapath, input$file1$name)
+      validate(need(r$ok, paste0("Unsupported / unreadable file: ", r$msg)))
+      r$data
+    })
+    
+    # Dynamic column mapping: only Genotype, Replication, and Trait(s)
+    # are ever offered — Module 1 supports RCBD raw data only.
+    output$colmap_ui <- renderUI({
+      df <- tryCatch(raw_upload(), error=function(e) NULL)
+      req(df)
+      cols <- names(df)
+      g_guess <- cols[grep("^GEN", cols, ignore.case=TRUE)][1] %||% cols[1]
+      r_guess <- cols[grep("^REP", cols, ignore.case=TRUE)][1] %||% cols[min(2,length(cols))]
+      tagList(
+        h5("Column Mapping", style="color:#2D6A4F;font-weight:700;"),
+        fluidRow(
+          column(4, selectInput(session$ns("map_gen"), "Genotype column", choices=cols, selected=g_guess)),
+          column(4, selectInput(session$ns("map_rep"), "Replication column", choices=cols, selected=r_guess))
+        ),
+        selectInput(session$ns("map_traits"), "Trait column(s)", choices=cols,
+                    selected=setdiff(cols, c(g_guess, r_guess)), multiple=TRUE)
+      )
+    })
+    
+    observeEvent(input$btn_validate, {
+      rv$validated <- FALSE; rv$valmsg <- NULL; rv$loaded <- FALSE; rv$data2 <- NULL; rv$est_out <- NULL
+      df <- tryCatch(raw_upload(), error=function(e) NULL)
+      if (is.null(df)) {
+        rv$valmsg <- show_validation_msgs(list(errors="Please upload a dataset first.", warnings=character(0)))
         return()
       }
-      r1 <- safe_read_file(input$file1$datapath, input$file1$name)
-      r2 <- safe_read_file(input$file2$datapath, input$file2$name)
-      fatal <- character(0)
-      if (!r1$ok) fatal <- c(fatal, paste0("Raw Data file: ", r1$msg))
-      if (!r2$ok) fatal <- c(fatal, paste0("Genotype Means file: ", r2$msg))
-      if (length(fatal) > 0) {
-        rv$valmsg <- show_validation_msgs(list(errors=fatal, warnings=character(0)))
-        return()
-      }
-      d1 <- r1$data; d2 <- r2$data
-      errors <- character(0); warnings <- character(0)
-
-      # Raw file must contain GEN and REP (any case)
-      gcol1 <- names(d1)[grep("^GEN$", names(d1), ignore.case=TRUE)][1]
-      rcol1 <- names(d1)[grep("^REP$", names(d1), ignore.case=TRUE)][1]
-      if (is.na(gcol1)) errors <- c(errors, "Raw Data file has no \u201CGEN\u201D (genotype) column. The raw file needs columns GEN, REP, then traits.")
-      if (is.na(rcol1)) errors <- c(errors, "Raw Data file has no \u201CREP\u201D (replication) column. The raw file needs columns GEN, REP, then traits.")
-      if (!is.na(gcol1) && gcol1 != "GEN") names(d1)[names(d1)==gcol1] <- "GEN"
-      if (!is.na(rcol1) && rcol1 != "REP") names(d1)[names(d1)==rcol1] <- "REP"
-
-      # Means file must contain GEN
-      gcol2 <- names(d2)[grep("^GEN$", names(d2), ignore.case=TRUE)][1]
-      if (is.na(gcol2)) errors <- c(errors, "Genotype Means file has no \u201CGEN\u201D column. It needs GEN, then one column per trait.")
-      if (!is.na(gcol2) && gcol2 != "GEN") names(d2)[names(d2)==gcol2] <- "GEN"
-
-      # trait_start sanity
-      ts <- suppressWarnings(as.integer(input$trait_start))
-      if (is.na(ts) || ts < 2) {
-        errors <- c(errors, "\u201CTrait start column\u201D must be 2 or more (column 1 is GEN). For the standard layout it is 3.")
-      } else if (ts > ncol(d1)) {
-        errors <- c(errors, paste0("\u201CTrait start column\u201D (", ts, ") is beyond the number of columns in the Raw Data file (", ncol(d1), "). Lower this value."))
-      }
-
-      # If structural errors, stop here
-      if (length(errors) > 0) {
-        rv$valmsg <- show_validation_msgs(list(errors=errors, warnings=warnings))
-        return()
-      }
-
-      # Content-level validation on raw traits
-      raw_traits <- names(d1)[ts:ncol(d1)]
-      raw_traits <- setdiff(raw_traits, c("GEN","REP"))
-      v1 <- validate_breeding_data(d1, list(GEN="GEN", REP="REP"), raw_traits, require_reps=TRUE)
-      mean_traits <- setdiff(names(d2), "GEN")
-      v2 <- validate_breeding_data(d2, list(GEN="GEN"), mean_traits, require_reps=FALSE)
-
-      # cross-file genotype consistency
-      g1 <- sort(unique(trimws(as.character(d1$GEN))))
-      g2 <- sort(unique(trimws(as.character(d2$GEN))))
-      only1 <- setdiff(g1, g2); only2 <- setdiff(g2, g1)
-      if (length(only1) > 0 || length(only2) > 0)
-        v2$warnings <- c(v2$warnings, paste0("Genotypes differ between the two files. ",
-          if (length(only1)>0) paste0(length(only1), " only in Raw data (e.g. ", paste(head(only1,4),collapse=", "), "). ") else "",
-          if (length(only2)>0) paste0(length(only2), " only in Means (e.g. ", paste(head(only2,4),collapse=", "), "). ") else "",
-          "D\u00B2 uses the Means file; mismatches can distort results."))
-
-      allerr <- c(v1$errors, v2$errors)
-      allwarn <- unique(c(v1$warnings, v2$warnings))
-      if (length(allerr) > 0) {
-        rv$valmsg <- show_validation_msgs(list(errors=allerr, warnings=allwarn))
-        return()
-      }
-
-      # Passed (warnings allowed) — finish loading
+      gen <- input$map_gen; rep <- input$map_rep; traits <- input$map_traits
+      
+      m1 <- validate_rcbd_mapping(df, gen, rep, traits)
+      if (!m1$ok) { rv$valmsg <- show_validation_msgs(m1); return() }
+      
+      m2 <- validate_breeding_data(df, list(GEN=gen, REP=rep), traits, require_reps=TRUE)
+      allerr  <- c(m1$errors, m2$errors)
+      allwarn <- unique(c(m1$warnings, m2$warnings))
+      if (length(allerr) > 0) { rv$valmsg <- show_validation_msgs(list(errors=allerr, warnings=allwarn)); return() }
+      
+      # Passed — standardize column names so every downstream analysis
+      # (MANOVA, D², Tocher, PCA, correlation) keeps working unmodified.
       result <- tryCatch({
-        d1n <- d1
-        for (tr in raw_traits) d1n[[tr]] <- suppressWarnings(as.numeric(as.character(d1n[[tr]])))
-        rv$data1 <- d1n; rv$data2 <- d2
-        rv$gm <- aggregate(d1n[ts:ncol(d1n)], by=list(GEN=d1n$GEN), mean, na.rm=TRUE)
-        rv$loaded <- TRUE
+        d1 <- df
+        names(d1)[names(d1)==gen] <- "GEN"
+        names(d1)[names(d1)==rep] <- "REP"
+        for (tr in traits) d1[[tr]] <- suppressWarnings(as.numeric(as.character(d1[[tr]])))
+        rv$data1 <- d1; rv$traits <- traits; rv$gen <- "GEN"; rv$rep <- "REP"
+        rv$gm <- aggregate(d1[traits], by=list(GEN=d1$GEN), mean, na.rm=TRUE)
+        rv$validated <- TRUE
         TRUE
       }, error=function(e) e)
       if (inherits(result, "error")) {
-        rv$valmsg <- show_validation_msgs(list(errors=paste0(
-          "The files were readable but processing failed: ", conditionMessage(result),
-          ". Check that GEN/REP columns and the trait-start column are correct."), warnings=character(0)))
+        rv$valmsg <- show_validation_msgs(list(errors=paste0("Processing failed: ", conditionMessage(result)), warnings=character(0)))
         return()
       }
       rv$valmsg <- show_validation_msgs(list(errors=character(0), warnings=allwarn))
-      if (length(allwarn) > 0)
-        showNotification("\u2705 D\u00B2 data loaded with warnings \u2014 review the notes above.", type="warning", duration=6)
-      else
-        showNotification("\u2705 D\u00B2 data loaded and validated!", type="message")
+      showNotification("\u2705 Dataset validated! Choose a Genotypic Value Estimation method below.", type="message", duration=6)
     })
-
+    
     output$val_alert <- renderUI({ rv$valmsg })
-
     output$data_stats <- renderUI({
-      req(rv$loaded)
+      req(rv$validated)
       d1 <- rv$data1
       div(class="d2-stat-row",
-          div(class="d2-stat-box", div(class="d2-stat-num", length(unique(d1$GEN))),  div(class="d2-stat-lbl","Genotypes")),
-          div(class="d2-stat-box", div(class="d2-stat-num", length(unique(d1$REP))),  div(class="d2-stat-lbl","Replications")),
-          div(class="d2-stat-box", div(class="d2-stat-num", ncol(d1)-input$trait_start+1), div(class="d2-stat-lbl","Traits")),
-          div(class="d2-stat-box", div(class="d2-stat-num", nrow(d1)),                div(class="d2-stat-lbl","Total Obs.")))
+          div(class="d2-stat-box", div(class="d2-stat-num", length(unique(d1$GEN))), div(class="d2-stat-lbl","Genotypes")),
+          div(class="d2-stat-box", div(class="d2-stat-num", length(unique(d1$REP))), div(class="d2-stat-lbl","Replications")),
+          div(class="d2-stat-box", div(class="d2-stat-num", length(rv$traits)), div(class="d2-stat-lbl","Traits")),
+          div(class="d2-stat-box", div(class="d2-stat-num", nrow(d1)), div(class="d2-stat-lbl","Total Obs.")))
     })
     output$preview1 <- renderDT({ req(rv$data1); datatable(head(rv$data1,10), options=list(scrollX=TRUE,dom='t'), rownames=FALSE, class="display compact") })
-    output$preview2 <- renderDT({ req(rv$data2); datatable(head(rv$data2,10), options=list(scrollX=TRUE,dom='t'), rownames=FALSE, class="display compact") })
-
+    
+    # ── Genotypic Value Estimation (Arithmetic Mean / BLUE / BLUP) ─
+    output$genoval_ui <- renderUI({
+      req(rv$validated)
+      mc <- d2_method_choices()
+      tagList(
+        fluidRow(
+          box(title="Genotypic Value Estimation", width=12, status="success", solidHeader=TRUE,
+              div(class="d2-alert", style="background:#eef7f1;",
+                  helpText(HTML(
+                    "<b>Arithmetic Mean</b>: simple per-genotype average across replications.<br>
+                   <b>BLUE</b> (Trait ~ GEN + REP, both fixed): genotype least-squares means via emmeans;
+                   recommended for routine, balanced/near-balanced RCBD trials.<br>
+                   <b>BLUP</b> (Trait ~ REP + (1|GEN), REP fixed/GEN random): genotype values shrunk toward
+                   the population mean via lme4; recommended for genomic selection or unbalanced data."))),
+              radioButtons(session$ns("est_method"), NULL, choices = mc, selected = mc[1]),
+              actionButton(session$ns("btn_run_workflow"), "\u25B6  Run Model", class="btn-success", icon=icon("play"))
+          )
+        )
+      )
+    })
+    
+    observeEvent(input$btn_run_workflow, {
+      req(rv$validated, rv$data1, rv$traits)
+      method <- input$est_method %||% "mean"
+      withProgress(message="Estimating genotypic values…", value=.4, {
+        res <- tryCatch(
+          estimate_all_traits(rv$data1, rv$traits, method, gen_col="GEN", rep_col="REP"),
+          error=function(e) e)
+        if (inherits(res, "error") || is.null(res$wide) || nrow(res$wide)==0) {
+          showNotification(paste("\u274C", if (inherits(res,"error")) conditionMessage(res) else "Estimation produced no values."), type="error", duration=10)
+          return()
+        }
+        rv$est_out <- res; rv$data2 <- res$wide; rv$gm <- res$wide; rv$loaded <- TRUE
+        rv$est_summary_txt <- paste0(
+          if (method=="mean") "Arithmetic Mean (genotype means across replications)" else toupper(method),
+          " \u2014 estimated from the RCBD raw dataset (Trait ~ ",
+          if (method=="blue") "GEN + REP" else if (method=="blup") "REP + (1|GEN)" else "GEN, by REP",
+          ").")
+        setProgress(1)
+        showNotification("\u2705 Model complete \u2014 all downstream analyses are ready.", type="message")
+      })
+    })
+    
+    # ════════════════════════════════════════════════════════════
+    #  OPTION 2 — directly-uploaded Genotype Means (GEN + Traits)
+    #  No REP column is required; model fitting is skipped entirely.
+    # ════════════════════════════════════════════════════════════
+    means_upload <- reactive({
+      req(input$file_means)
+      r <- safe_read_file(input$file_means$datapath, input$file_means$name)
+      validate(need(r$ok, paste0("Unsupported / unreadable file: ", r$msg)))
+      r$data
+    })
+    output$colmap_means_ui <- renderUI({
+      df <- tryCatch(means_upload(), error=function(e) NULL)
+      req(df)
+      cols <- names(df)
+      g_guess <- cols[grep("^GEN", cols, ignore.case=TRUE)][1] %||% cols[1]
+      tagList(
+        selectInput(session$ns("map_gen_means"), "Genotype column", choices=cols, selected=g_guess),
+        selectInput(session$ns("map_traits_means"), "Trait column(s)", choices=cols,
+                    selected=setdiff(cols, g_guess), multiple=TRUE)
+      )
+    })
+    
+    observeEvent(input$btn_validate_means, {
+      rv$validated_means <- FALSE; rv$valmsg_means <- NULL; rv$loaded <- FALSE; rv$data2 <- NULL; rv$est_out <- NULL
+      df <- tryCatch(means_upload(), error=function(e) NULL)
+      if (is.null(df)) {
+        rv$valmsg_means <- show_validation_msgs(list(errors="Please upload a Genotype Means dataset first.", warnings=character(0)))
+        return()
+      }
+      gen <- input$map_gen_means; traits <- input$map_traits_means
+      errors <- character(0); warnings <- character(0)
+      dupnames <- unique(names(df)[duplicated(names(df))])
+      if (length(dupnames) > 0) errors <- c(errors, paste0("The uploaded file has duplicated column names: ", paste(dupnames, collapse=", "), "."))
+      if (is.null(gen) || !nzchar(gen)) errors <- c(errors, "Please map the Genotype column.")
+      if (length(traits) == 0) errors <- c(errors, "Please select at least one Trait column.")
+      if (!is.null(gen) && gen %in% traits) errors <- c(errors, "The Genotype column cannot also be selected as a Trait column.")
+      if (length(errors) > 0) { rv$valmsg_means <- show_validation_msgs(list(errors=errors, warnings=warnings)); return() }
+      
+      m2 <- validate_breeding_data(df, list(GEN=gen), traits, require_reps=FALSE)
+      allerr <- m2$errors; allwarn <- unique(c(warnings, m2$warnings))
+      if (length(allerr) > 0) { rv$valmsg_means <- show_validation_msgs(list(errors=allerr, warnings=allwarn)); return() }
+      
+      result <- tryCatch({
+        d2 <- df[, c(gen, traits), drop=FALSE]
+        names(d2)[names(d2)==gen] <- "GEN"
+        for (tr in traits) d2[[tr]] <- suppressWarnings(as.numeric(as.character(d2[[tr]])))
+        rv$traits_means <- traits
+        rv$data2 <- d2; rv$gm <- d2; rv$loaded <- TRUE; rv$validated_means <- TRUE
+        rv$est_out <- list(
+          wide = d2,
+          detail = do.call(rbind, lapply(traits, function(tr)
+            data.frame(Trait=tr, Genotype=d2$GEN, Estimate=round(d2[[tr]],4),
+                       SE=NA_real_, Genotypic_Variance=NA_real_, Residual_Variance=NA_real_,
+                       Heritability=NA_real_, stringsAsFactors=FALSE)))
+        )
+        rv$est_summary_txt <- "Uploaded Genotype Means \u2014 used directly (no model fitting)."
+        TRUE
+      }, error=function(e) e)
+      if (inherits(result, "error")) {
+        rv$valmsg_means <- show_validation_msgs(list(errors=paste0("Processing failed: ", conditionMessage(result)), warnings=character(0)))
+        return()
+      }
+      rv$valmsg_means <- show_validation_msgs(list(errors=character(0), warnings=allwarn))
+      showNotification("\u2705 Genotype Means validated and ready for analysis.", type="message", duration=6)
+    })
+    output$val_alert_means <- renderUI({ rv$valmsg_means })
+    output$data_stats_means <- renderUI({
+      req(rv$validated_means)
+      d2 <- rv$data2
+      div(class="d2-stat-row",
+          div(class="d2-stat-box", div(class="d2-stat-num", nrow(d2)), div(class="d2-stat-lbl","Genotypes")),
+          div(class="d2-stat-box", div(class="d2-stat-num", length(rv$traits_means)), div(class="d2-stat-lbl","Traits")))
+    })
+    output$preview_means <- renderDT({ req(rv$validated_means, rv$data2); datatable(head(rv$data2,10), options=list(scrollX=TRUE,dom='t'), rownames=FALSE, class="display compact") })
+    
+    # ── Output tab: Genotypic Values Used for Downstream Analysis ───
+    output$est_summary <- renderUI({ req(rv$est_summary_txt); div(class="d2-alert", style="background:#e3f5e9;color:#155d34;", rv$est_summary_txt) })
+    output$est_tbl <- renderDT({
+      req(rv$est_out, rv$est_out$detail)
+      datatable(rv$est_out$detail, options=d2_dt_opts, rownames=FALSE, class="display compact")
+    })
+    dl_est_fun <- function(f) { req(rv$est_out, rv$est_out$detail); write.csv(rv$est_out$detail, f, row.names=FALSE) }
+    output$dl_est_csv    <- downloadHandler("Estimated_Genotypic_Values.csv", dl_est_fun)
+    output$dl_est_csv_ex <- downloadHandler("Estimated_Genotypic_Values.csv", dl_est_fun)
+    
     observeEvent(input$btn_manova, {
-      req(rv$loaded)
+      req(rv$loaded, rv$data1, rv$traits)
       withProgress(message="Running MANOVA…", value=.3, {
         tryCatch({
-          d1 <- rv$data1; ts <- input$trait_start
-          dv <- as.matrix(d1[,ts:ncol(d1)])
-          mod <- manova(dv ~ as.factor(GEN)+as.factor(REP), data=d1)
+          d1 <- rv$data1
+          dv <- as.matrix(d1[, rv$traits, drop=FALSE])
+          # MANOVA always runs on the raw RCBD plot-level data (Option 1).
+          # Genotype + Replication enter as fixed factors. (Not available
+          # when only Genotype Means were uploaded — see req() above.)
+          rhs <- "as.factor(GEN)"
+          if (!is.null(rv$rep))   rhs <- paste(rhs, "+ as.factor(REP)")
+          mod <- manova(as.formula(paste("dv ~", rhs)), data=d1)
           ss  <- SSD(mod)
           rv$covar <- ss$SSD/ss$df; rv$mod <- mod; rv$dv <- dv; rv$ran_manova <- TRUE
           setProgress(1); showNotification("✅ MANOVA complete!", type="message")
@@ -702,7 +1167,8 @@ d2Server <- function(id) {
       nc <- sapply(df, is.numeric)
       datatable(cbind(df[,!nc,drop=FALSE], round(df[,nc],4)), options=d2_dt_opts, rownames=FALSE, class="display compact")
     })
-
+    output$anova_tbl_dl_ui <- renderUI({ req(rv$ran_manova); downloadButton(session$ns("dl_anova"), "\u2B07  ANOVA per Trait (.csv)", class="btn-warning btn-sm") })
+    
     observeEvent(input$btn_d2, {
       req(rv$covar, rv$data2)
       withProgress(message="Computing D² distances…", value=.5, {
@@ -710,6 +1176,7 @@ d2Server <- function(id) {
           rv$d_dist <- D2.dist(rv$data2[,-1], rv$covar)
           rv$dm     <- as.matrix(rv$d_dist)
           rownames(rv$dm) <- colnames(rv$dm) <- as.character(rv$data2[,1])
+          rv$ran_d2 <- TRUE
           setProgress(1); showNotification("✅ D² complete!", type="message")
         }, error=function(e) showNotification(paste("❌",e$message), type="error"))
       })
@@ -723,6 +1190,7 @@ d2Server <- function(id) {
           div(class="d2-stat-box", div(class="d2-stat-num",round(sd(lt),2)),   div(class="d2-stat-lbl","SD D²")))
     })
     output$d2_tbl <- renderDT({ req(rv$dm); datatable(as.data.frame(round(rv$dm,3)), options=d2_dt_opts, class="display compact") })
+    output$d2_tbl_dl_ui <- renderUI({ req(rv$ran_d2); downloadButton(session$ns("dl_d2mat"), "\u2B07  D\u00B2 Matrix (.csv)", class="btn-warning btn-sm") })
     output$d2_heatmap <- renderPlotly({
       req(rv$dm); dm <- rv$dm
       plot_ly(z=dm, x=colnames(dm), y=rownames(dm), type="heatmap",
@@ -731,7 +1199,7 @@ d2Server <- function(id) {
         layout(paper_bgcolor="white", plot_bgcolor="white",
                xaxis=list(tickangle=-45), yaxis=list(), margin=list(l=70,b=70))
     })
-
+    
     observeEvent(input$btn_tocher, {
       req(rv$d_dist)
       withProgress(message="Running Tocher…", value=.4, {
@@ -745,10 +1213,60 @@ d2Server <- function(id) {
             cv[gn[idx]] <- i
           }
           rv$cluster_vec <- cv
+          # Feature 2 default: dendrogram cluster count starts equal to Tocher's
+          rv$dendro_k <- nc; rv$dendro_pal <- rv$pal; rv$hc_method_used <- "ward.D2"; rv$optk_plot <- NULL
+          rv$ran_tocher <- TRUE
           setProgress(1); showNotification("✅ Tocher complete!", type="message")
         }, error=function(e) showNotification(paste("❌",e$message), type="error"))
       })
     })
+    
+    # ── FEATURE 2: Cluster-number selection for the Ward dendrogram ─
+    observeEvent(input$btn_apply_k, {
+      req(rv$data2, rv$n_clust)
+      withProgress(message="Determining cluster number…", value=.5, {
+        tryCatch({
+          mat <- scale(as.matrix(rv$data2[,-1])); rownames(mat) <- as.character(rv$data2[,1])
+          k <- switch(input$clust_k_method,
+                      tocher     = rv$n_clust,
+                      manual     = as.integer(input$manual_k),
+                      { opt <- d2_optimal_k(mat, method=input$clust_k_method); rv$optk_plot <- opt$plot; opt$k })
+          if (input$clust_k_method == "tocher") rv$optk_plot <- NULL
+          rv$dendro_k <- k
+          rv$dendro_pal <- d2_make_pal(k)
+          rv$hc_method_used <- input$hc_method
+          setProgress(1)
+          showNotification(paste0("✅ Dendrogram will use k = ", k, " (", input$hc_method, ")."), type="message")
+        }, error=function(e) showNotification(paste("❌",e$message), type="error"))
+      })
+    })
+    output$optk_plot <- renderPlot({ req(rv$optk_plot); print(rv$optk_plot) })
+    output$optk_dl_ui <- renderUI({ req(rv$optk_plot); downloadButton(session$ns("dl_optk_pdf"), "\u2B07  Optimal-k Plot (.pdf)", class="btn-primary btn-sm") })
+    output$dl_optk_pdf <- downloadHandler(paste0("Optimal_k_Plot_",Sys.Date(),".pdf"), function(f){ req(rv$optk_plot); save_pdf(rv$optk_plot, f, 9, 6) })
+    
+    # ── Inter/Intra-cluster distance basis follows whichever clustering
+    #    method currently drives the dendrogram (Feature 2 selector):
+    #    "tocher" (default) keeps Tocher's own clusters/distances exactly
+    #    as before; any other choice (Elbow/Silhouette/Gap/User-defined)
+    #    recomputes the distances from the Ward/other-linkage cut at the
+    #    selected k. Both the Network Distance Plot and the Inter/Intra
+    #    distance table use this single source so they always agree with
+    #    the dendrogram currently on screen.
+    active_cluster_info <- reactive({
+      req(rv$toc, rv$dm, rv$n_clust, rv$pal)
+      km <- input$clust_k_method %||% "tocher"
+      if (km == "tocher") {
+        list(dist_m = as.matrix(rv$toc$distClust), n_clust = rv$n_clust, pal = rv$pal, label = "Tocher Clusters")
+      } else {
+        k    <- rv$dendro_k %||% rv$n_clust
+        meth <- rv$hc_method_used %||% "ward.D2"
+        pal  <- rv$dendro_pal %||% d2_make_pal(k)
+        cl   <- d2_hc_cut_membership(rv$dm, k, meth)
+        list(dist_m = d2_cluster_distance_summary(rv$dm, cl), n_clust = k, pal = pal,
+             label = paste0(meth, " Clusters"))
+      }
+    })
+    
     output$tocher_stats <- renderUI({
       req(rv$toc); cs <- sapply(rv$toc$clusters, length)
       div(class="d2-stat-row",
@@ -762,13 +1280,23 @@ d2Server <- function(id) {
       df <- data.frame(Genotype=names(rv$cluster_vec), Cluster=rv$cluster_vec, stringsAsFactors=FALSE)
       datatable(df[order(df$Cluster),], options=list(pageLength=15,dom='frtip',scrollX=TRUE), rownames=FALSE, class="display compact")
     })
+    output$tocher_mem_dl_ui <- renderUI({ req(rv$ran_tocher); downloadButton(session$ns("dl_tocher"), "\u2B07  Cluster Membership (.csv)", class="btn-warning btn-sm") })
     output$tocher_dist <- renderDT({
-      req(rv$toc); dm <- as.data.frame(round(as.matrix(rv$toc$distClust),4))
+      ci <- active_cluster_info()
+      dm <- as.data.frame(round(ci$dist_m, 4))
       rownames(dm) <- colnames(dm) <- paste0("C",seq_len(nrow(dm)))
-      datatable(dm, options=list(scrollX=TRUE,dom='t'), class="display compact")
+      datatable(dm, options=list(scrollX=TRUE,dom='t'), class="display compact",
+                caption=htmltools::tags$caption(style="caption-side:top;text-align:left;color:#2D6A4F;font-weight:600;", paste0("Basis: ", ci$label)))
     })
-    output$dendro_plot  <- renderPlot({ req(rv$dm, rv$n_clust, rv$pal); d2_draw_dendro(rv$dm, rv$n_clust, rv$pal) })
-    output$network_plot <- renderPlot({ req(rv$toc, rv$n_clust, rv$pal); print(d2_build_network(rv$toc, rv$n_clust, rv$pal)) })
+    output$tocher_dist_dl_ui <- renderUI({ req(rv$ran_tocher); downloadButton(session$ns("dl_cluster_dist"), "\u2B07  Inter/Intra Distances (.csv)", class="btn-warning btn-sm") })
+    output$dendro_plot  <- renderPlot({
+      req(rv$dm); k <- rv$dendro_k %||% rv$n_clust; pal <- rv$dendro_pal %||% rv$pal; meth <- rv$hc_method_used %||% "ward.D2"
+      req(k, pal); d2_draw_dendro(rv$dm, k, pal, meth)
+    })
+    output$network_plot <- renderPlot({
+      ci <- active_cluster_info()
+      print(d2_build_network(ci$dist_m, ci$n_clust, ci$pal, ci$label))
+    })
     output$cluster_means <- renderDT({
       req(rv$cluster_vec, rv$data2)
       d2c <- rv$data2; d2c$Cluster <- rv$cluster_vec[match(as.character(d2c[,1]), names(rv$cluster_vec))]
@@ -776,7 +1304,8 @@ d2Server <- function(id) {
       nc  <- sapply(cm, is.numeric)
       datatable(cbind(cm[,!nc,drop=FALSE], round(cm[,nc],3)), options=d2_dt_opts, rownames=FALSE, class="display compact")
     })
-
+    output$cluster_means_dl_ui <- renderUI({ req(rv$ran_tocher); downloadButton(session$ns("dl_cluster_means"), "\u2B07  Cluster-wise Trait Means (.csv)", class="btn-warning btn-sm") })
+    
     observeEvent(input$btn_pca, {
       req(rv$data2)
       withProgress(message="Running PCA…", value=.5, {
@@ -784,6 +1313,7 @@ d2Server <- function(id) {
           mn <- rv$data2[,-1]; rownames(mn) <- as.character(rv$data2[,1])
           pca <- prcomp(mn, scale.=TRUE)
           rv$pca_res <- pca; rv$eig_val <- get_eigenvalue(pca)
+          rv$ran_pca <- TRUE
           setProgress(1); showNotification("✅ PCA complete!", type="message")
         }, error=function(e) showNotification(paste("❌",e$message), type="error"))
       })
@@ -835,17 +1365,20 @@ d2Server <- function(id) {
       df <- df[,c("PC",names(df)[1:3])]
       datatable(df, options=list(pageLength=10,dom='t',scrollX=TRUE), rownames=FALSE, class="display compact")
     })
+    output$eig_tbl_dl_ui <- renderUI({ req(rv$ran_pca); downloadButton(session$ns("dl_eig"), "\u2B07  Eigenvalues (.csv)", class="btn-warning btn-sm") })
     output$loading_tbl <- renderDT({
       req(rv$pca_res); datatable(as.data.frame(round(rv$pca_res$rotation,4)),
-                                  options=list(pageLength=10,dom='t',scrollX=TRUE), class="display compact")
+                                 options=list(pageLength=10,dom='t',scrollX=TRUE), class="display compact")
     })
-
+    output$loading_tbl_dl_ui <- renderUI({ req(rv$ran_pca); downloadButton(session$ns("dl_loads"), "\u2B07  Variable Loadings (.csv)", class="btn-warning btn-sm") })
+    
     observeEvent(input$btn_corr, {
       req(rv$data2)
       withProgress(message="Computing correlation…", value=.5, {
         tryCatch({
           mn <- as.matrix(rv$data2[,-1]); cr <- rcorr(mn)
           rv$cor_mat <- cr$r; rv$p_mat <- cr$P
+          rv$ran_corr <- TRUE
           setProgress(1); showNotification("✅ Correlation complete!", type="message")
         }, error=function(e) showNotification(paste("❌",e$message), type="error"))
       })
@@ -858,7 +1391,8 @@ d2Server <- function(id) {
                     rwb=list(c(0,"#053061"),c(.5,"white"),c(1,"#67001f")),
                     pastel=list(c(0,"#A6CEE3"),c(.5,"white"),c(1,"#FB9A99")),
                     viridis=list(c(0,"#440154"),c(.33,"#31688e"),c(.66,"#35b779"),c(1,"#fde725")))
-      plot_ly(z=cm, x=colnames(cm), y=rownames(cm), text=txt, type="heatmap",
+      plot_ly(z=cm, x=colnames(cm), y=rownames(cm), text=txt, texttemplate="%{text}",
+              textfont=list(size=10, color="#0D3B2E"), type="heatmap",
               colorscale=cs, zmin=-1, zmax=1,
               hovertemplate="Trait1: %{y}<br>Trait2: %{x}<br>r: %{z:.3f}<extra></extra>") %>%
         layout(xaxis=list(tickangle=-45), margin=list(l=80,b=80), title=list(text="Pearson Correlation Matrix"))
@@ -866,39 +1400,44 @@ d2Server <- function(id) {
     output$corr_tbl <- renderDT({
       req(rv$cor_mat); datatable(as.data.frame(round(rv$cor_mat,4)), options=list(scrollX=TRUE,dom='t'), class="display compact")
     })
-    output$sig_pairs_tbl <- renderDT({
+    output$corr_tbl_dl_ui <- renderUI({ req(rv$ran_corr); downloadButton(session$ns("dl_corr"), "\u2B07  Correlation Matrix (.csv)", class="btn-warning btn-sm") })
+    sig_pairs_df <- reactive({
       req(rv$cor_mat, rv$p_mat); cm <- rv$cor_mat; pm <- rv$p_mat
       trn <- which(lower.tri(cm), arr.ind=TRUE)
       df  <- data.frame(Trait1=rownames(cm)[trn[,1]], Trait2=colnames(cm)[trn[,2]],
                         r=round(cm[trn],4), p_value=round(pm[trn],4), stringsAsFactors=FALSE)
       df$Significance <- ifelse(df$p_value<=.001,"***", ifelse(df$p_value<=.01,"**", ifelse(df$p_value<=.05,"*","ns")))
-      df <- df[df$p_value<=.05,][order(df$p_value[df$p_value<=.05]),]
-      datatable(df, options=list(pageLength=15,dom='frtip',scrollX=TRUE), rownames=FALSE, class="display compact")
+      df[df$p_value<=.05,][order(df$p_value[df$p_value<=.05]),]
     })
-
+    output$sig_pairs_tbl_dl_ui <- renderUI({ req(rv$ran_corr); downloadButton(session$ns("dl_sig_pairs"), "\u2B07  Significant Pairs (.csv)", class="btn-warning btn-sm") })
+    output$dl_sig_pairs <- downloadHandler(paste0("Significant_Pairs_",Sys.Date(),".csv"), function(f){ write.csv(sig_pairs_df(), f, row.names=FALSE) })
+    output$sig_pairs_tbl <- renderDT({
+      datatable(sig_pairs_df(), options=list(pageLength=15,dom='frtip',scrollX=TRUE), rownames=FALSE, class="display compact")
+    })
+    
     # ── D² Download Handlers ─────────────────────────────
     output$dl_means  <- downloadHandler("Genotype_Means.csv",     function(f){ req(rv$gm); df <- rv$gm; nc <- sapply(df, is.numeric); df[nc] <- round(df[nc], 4); write.csv(df, f, row.names=FALSE)})
     output$dl_d2mat  <- downloadHandler("D2_Distance_Matrix.csv", function(f){ req(rv$dm);       write.csv(round(rv$dm,4),f)})
     output$dl_tocher <- downloadHandler("Tocher_Clusters.csv",    function(f){ req(rv$cluster_vec); df <- data.frame(Genotype=names(rv$cluster_vec),Cluster=rv$cluster_vec); write.csv(df[order(df$Cluster),],f,row.names=FALSE)})
     output$dl_cluster_means <- downloadHandler("Cluster_Trait_Means.csv", function(f){ req(rv$cluster_vec, rv$data2); d2c <- rv$data2; d2c$Cluster <- rv$cluster_vec[match(as.character(d2c[,1]), names(rv$cluster_vec))]; cm <- aggregate(d2c[,-c(1,ncol(d2c))], by=list(Cluster=d2c$Cluster), mean); nc <- sapply(cm, is.numeric); cm[nc] <- round(cm[nc], 4); write.csv(cm[order(cm$Cluster),], f, row.names=FALSE) })
-    output$dl_cluster_dist  <- downloadHandler("Cluster_Distances.csv",   function(f){ req(rv$toc); dm <- as.data.frame(round(as.matrix(rv$toc$distClust), 4)); rownames(dm) <- colnames(dm) <- paste0("C", seq_len(nrow(dm))); write.csv(dm, f) })
+    output$dl_cluster_dist  <- downloadHandler("Cluster_Distances.csv",   function(f){ ci <- active_cluster_info(); dm <- as.data.frame(round(ci$dist_m, 4)); rownames(dm) <- colnames(dm) <- paste0("C", seq_len(nrow(dm))); write.csv(dm, f) })
     output$dl_corr   <- downloadHandler("Correlation_Matrix.csv", function(f){ req(rv$cor_mat);  write.csv(round(rv$cor_mat,6),f)})
     output$dl_eig    <- downloadHandler("PCA_Eigenvalues.csv",    function(f){ req(rv$eig_val);  write.csv(round(rv$eig_val,6),f)})
     output$dl_loads  <- downloadHandler("PCA_Loadings.csv",       function(f){ req(rv$pca_res);  write.csv(round(as.data.frame(rv$pca_res$rotation),6),f)})
     output$dl_scores <- downloadHandler("PCA_Scores.csv",         function(f){ req(rv$pca_res);  df <- cbind(Genotype=rownames(rv$pca_res$x),as.data.frame(round(rv$pca_res$x,6))); write.csv(df,f,row.names=FALSE)})
     output$dl_anova  <- downloadHandler("ANOVA_Per_Trait.csv",    function(f){ req(rv$ran_manova); al <- summary.aov(rv$mod); rows <- lapply(seq_along(al),function(i){tbl <- as.data.frame(al[[i]]);tbl$Trait<-names(al)[i];tbl$Source<-rownames(tbl);tbl}); df <- do.call(rbind,rows); write.csv(df,f,row.names=FALSE)})
-
+    
     for (id_pair in list(c("dl_heatmap_pdf","dl_heatmap_pdf_ex"))) {
       local({ lid <- id_pair
-        for (lid_i in lid) local({ lii <- lid_i
-          output[[lii]] <- downloadHandler("D2_Heatmap.pdf", function(f){ req(rv$dm); p <- ggplot(reshape2::melt(rv$dm) %>% setNames(c("G1","G2","D")), aes(x=G2,y=G1,fill=D)) + geom_tile(colour="white",linewidth=.3) + scale_fill_gradientn(colours=c("#053061","#2166ac","#d1e5f0","#fddbc7","#d6604d","#67001f"),name="D²") + labs(title="Mahalanobis D² Heatmap",x=NULL,y=NULL) + theme_met() + theme(axis.text.x=element_text(angle=90,vjust=.5,hjust=1,size=7),axis.text.y=element_text(size=7),panel.grid=element_blank()); n <- nrow(rv$dm); save_pdf(p,f,max(8,n*.4),max(7,n*.4)) })
-        })
+      for (lid_i in lid) local({ lii <- lid_i
+      output[[lii]] <- downloadHandler("D2_Heatmap.pdf", function(f){ req(rv$dm); p <- ggplot(reshape2::melt(rv$dm) %>% setNames(c("G1","G2","D")), aes(x=G2,y=G1,fill=D)) + geom_tile(colour="white",linewidth=.3) + scale_fill_gradientn(colours=c("#053061","#2166ac","#d1e5f0","#fddbc7","#d6604d","#67001f"),name="D²") + labs(title="Mahalanobis D² Heatmap",x=NULL,y=NULL) + theme_met() + theme(axis.text.x=element_text(angle=90,vjust=.5,hjust=1,size=7),axis.text.y=element_text(size=7),panel.grid=element_blank()); n <- nrow(rv$dm); save_pdf(p,f,max(8,n*.4),max(7,n*.4)) })
+      })
       })
     }
-    output$dl_dendro_pdf    <- downloadHandler("Dendrogram.pdf",    function(f){ req(rv$dm,rv$n_clust,rv$pal); cairo_pdf(f,14,8); d2_draw_dendro(rv$dm,rv$n_clust,rv$pal); dev.off()})
-    output$dl_dendro_pdf_ex <- downloadHandler("Dendrogram.pdf",    function(f){ req(rv$dm,rv$n_clust,rv$pal); cairo_pdf(f,14,8); d2_draw_dendro(rv$dm,rv$n_clust,rv$pal); dev.off()})
-    output$dl_network_pdf    <- downloadHandler("Network_Plot.pdf", function(f){ req(rv$toc,rv$n_clust,rv$pal); save_pdf(d2_build_network(rv$toc,rv$n_clust,rv$pal),f,10,10)})
-    output$dl_network_pdf_ex <- downloadHandler("Network_Plot.pdf", function(f){ req(rv$toc,rv$n_clust,rv$pal); save_pdf(d2_build_network(rv$toc,rv$n_clust,rv$pal),f,10,10)})
+    output$dl_dendro_pdf    <- downloadHandler("Dendrogram.pdf",    function(f){ req(rv$dm); k<-rv$dendro_k%||%rv$n_clust; pal<-rv$dendro_pal%||%rv$pal; meth<-rv$hc_method_used%||%"ward.D2"; req(k,pal); cairo_pdf(f,14,8); d2_draw_dendro(rv$dm,k,pal,meth); dev.off()})
+    output$dl_dendro_pdf_ex <- downloadHandler("Dendrogram.pdf",    function(f){ req(rv$dm); k<-rv$dendro_k%||%rv$n_clust; pal<-rv$dendro_pal%||%rv$pal; meth<-rv$hc_method_used%||%"ward.D2"; req(k,pal); cairo_pdf(f,14,8); d2_draw_dendro(rv$dm,k,pal,meth); dev.off()})
+    output$dl_network_pdf    <- downloadHandler("Network_Plot.pdf", function(f){ ci<-active_cluster_info(); save_pdf(d2_build_network(ci$dist_m,ci$n_clust,ci$pal,ci$label),f,10,10)})
+    output$dl_network_pdf_ex <- downloadHandler("Network_Plot.pdf", function(f){ ci<-active_cluster_info(); save_pdf(d2_build_network(ci$dist_m,ci$n_clust,ci$pal,ci$label),f,10,10)})
     output$dl_scree_pdf      <- downloadHandler("Scree_Plot.pdf",   function(f){ req(rv$pca_res,rv$eig_val); save_pdf(d2_build_scree(rv$pca_res,rv$eig_val),f,10,6)})
     output$dl_scree_pdf_ex   <- downloadHandler("Scree_Plot.pdf",   function(f){ req(rv$pca_res,rv$eig_val); save_pdf(d2_build_scree(rv$pca_res,rv$eig_val),f,10,6)})
     output$dl_biplot_pdf     <- downloadHandler("PCA_Biplot.pdf",   function(f){ req(rv$pca_res,rv$eig_val); save_pdf(d2_build_biplot(rv$pca_res,rv$eig_val),f,10,8)})
@@ -906,6 +1445,108 @@ d2Server <- function(id) {
     output$dl_pca_cluster_pdf <- downloadHandler(paste0("PCA_Cluster.pdf"), function(f){ req(rv$pca_res,rv$cluster_vec,rv$pal,rv$eig_val); ev<-rv$eig_val; pca<-rv$pca_res; mcv<-rv$cluster_vec[match(rownames(pca$x),names(rv$cluster_vec))]; df<-data.frame(PC1=pca$x[,1],PC2=pca$x[,2],Geno=rownames(pca$x),Cluster=as.factor(mcv)); p<-ggplot(df,aes(PC1,PC2,colour=Cluster,label=Geno))+geom_point(size=3,alpha=.85)+ggrepel::geom_text_repel(size=2.8,max.overlaps=25)+scale_colour_manual(values=rv$pal)+labs(title="PCA Cluster Overlay",x=paste0("PC1 (",round(ev[1,2],1),"%)"),y=paste0("PC2 (",round(ev[2,2],1),"%)"),colour="Cluster")+theme_met(); save_pdf(p,f,12,9)})
     output$dl_corr_pdf     <- downloadHandler("Correlation_Heatmap.pdf", function(f){ req(rv$cor_mat,rv$p_mat); p <- d2_build_corr_heatmap(rv$cor_mat,rv$p_mat,input$corr_palette); n<-nrow(rv$cor_mat); save_pdf(p,f,max(7,n*.6),max(6,n*.55))})
     output$dl_corr_pdf_ex  <- downloadHandler("Correlation_Heatmap.pdf", function(f){ req(rv$cor_mat,rv$p_mat); p <- d2_build_corr_heatmap(rv$cor_mat,rv$p_mat,input$corr_palette); n<-nrow(rv$cor_mat); save_pdf(p,f,max(7,n*.6),max(6,n*.55))})
+    
+    # ════════════════════════════════════════════════════════════
+    #  DYNAMIC EXPORT — only shows/bundles analyses actually run
+    # ════════════════════════════════════════════════════════════
+    output$export_status_ui <- renderUI({
+      items <- list(
+        c("Genotypic Values",  rv$loaded %||% FALSE),
+        c("MANOVA",            rv$ran_manova %||% FALSE),
+        c("Mahalanobis D\u00B2", rv$ran_d2 %||% FALSE),
+        c("Tocher / Ward Clustering", rv$ran_tocher %||% FALSE),
+        c("PCA",               rv$ran_pca %||% FALSE),
+        c("Correlation",       rv$ran_corr %||% FALSE)
+      )
+      div(style="display:flex;flex-wrap:wrap;gap:10px;",
+          lapply(items, function(it) {
+            done <- isTRUE(as.logical(it[2]))
+            span(style=paste0("padding:6px 12px;border-radius:14px;font-size:12px;font-weight:600;",
+                              if (done) "background:#e3f5e9;color:#155d34;" else "background:#f1f1f1;color:#888;"),
+                 paste0(if (done) "\u2705 " else "\u23F3 ", it[1]))
+          })
+      )
+    })
+    
+    output$export_csv_ui <- renderUI({
+      btn <- function(id, label) downloadButton(session$ns(id), label, class="btn-warning btn-block")
+      rows <- list()
+      if (isTRUE(rv$loaded))      rows <- c(rows, list(btn("dl_means",  "Genotype Means (.csv)")))
+      if (!is.null(rv$est_out$detail)) rows <- c(rows, list(btn("dl_est_csv_ex", "Estimated Genotypic Values (.csv)")))
+      if (isTRUE(rv$ran_manova))  rows <- c(rows, list(btn("dl_anova",  "ANOVA per Trait (.csv)")))
+      if (isTRUE(rv$ran_d2))      rows <- c(rows, list(btn("dl_d2mat",  "D\u00B2 Matrix (.csv)")))
+      if (isTRUE(rv$ran_tocher))  rows <- c(rows, list(btn("dl_tocher", "Tocher Clusters (.csv)")),
+                                            list(btn("dl_cluster_means", "Cluster-wise Trait Means (.csv)")),
+                                            list(btn("dl_cluster_dist",  "Inter/Intra Cluster Distances (.csv)")))
+      if (isTRUE(rv$ran_pca)) rows <- c(rows, list(btn("dl_eig", "PCA Eigenvalues (.csv)")),
+                                        list(btn("dl_scores", "PCA Scores (.csv)")),
+                                        list(btn("dl_loads", "PCA Loadings (.csv)")))
+      if (isTRUE(rv$ran_corr)) rows <- c(rows, list(btn("dl_corr", "Correlation Matrix (.csv)")),
+                                         list(btn("dl_sig_pairs", "Significant Pairs (.csv)")))
+      if (length(rows) == 0) return(p(style="color:#888;", "No analyses have been run yet \u2014 results will appear here automatically once you run them."))
+      tagList(lapply(rows, function(r) tagList(r, br())))
+    })
+    
+    output$export_pdf_ui <- renderUI({
+      btn <- function(id, label) downloadButton(session$ns(id), label, class="btn-primary btn-block")
+      rows <- list()
+      if (isTRUE(rv$ran_d2))     rows <- c(rows, list(btn("dl_heatmap_pdf_ex", "D\u00B2 Heatmap (.pdf)")))
+      if (isTRUE(rv$ran_tocher)) rows <- c(rows, list(btn("dl_dendro_pdf_ex",  "Dendrogram (.pdf)")),
+                                           list(btn("dl_network_pdf_ex", "Network Plot (.pdf)")))
+      if (isTRUE(rv$ran_pca))    rows <- c(rows, list(btn("dl_scree_pdf_ex",   "Scree Plot (.pdf)")),
+                                           list(btn("dl_biplot_pdf_ex",  "PCA Biplot (.pdf)")),
+                                           list(btn("dl_pca_cluster_pdf","PCA Cluster Overlay (.pdf)")))
+      if (isTRUE(rv$ran_corr))   rows <- c(rows, list(btn("dl_corr_pdf_ex",    "Correlation Heatmap (.pdf)")))
+      if (length(rows) == 0) return(p(style="color:#888;", "No plots have been generated yet \u2014 they will appear here automatically once you run an analysis."))
+      tagList(lapply(rows, function(r) tagList(r, br())))
+    })
+    
+    # "Download All (ZIP)" — bundles only the CSVs/PDFs for analyses
+    # that have actually been run in this session (see build_zip_export()).
+    output$dl_all_zip <- downloadHandler(
+      filename = function() paste0("D2_Module1_Results_", Sys.Date(), ".zip"),
+      content = function(file) {
+        items <- list()
+        if (isTRUE(rv$loaded)) items$means <- list(filename="Genotype_Means.csv", write=function(p){ df<-rv$gm; nc<-sapply(df,is.numeric); df[nc]<-round(df[nc],4); write.csv(df,p,row.names=FALSE) })
+        if (!is.null(rv$est_out$detail)) items$est <- list(filename="Estimated_Genotypic_Values.csv", write=function(p) write.csv(rv$est_out$detail, p, row.names=FALSE))
+        if (isTRUE(rv$ran_manova)) {
+          items$anova <- list(filename="ANOVA_Per_Trait.csv", write=function(p){ al<-summary.aov(rv$mod); rows<-lapply(seq_along(al),function(i){tbl<-as.data.frame(al[[i]]);tbl$Trait<-names(al)[i];tbl$Source<-rownames(tbl);tbl}); write.csv(do.call(rbind,rows),p,row.names=FALSE) })
+        }
+        if (isTRUE(rv$ran_d2)) {
+          items$d2mat <- list(filename="D2_Distance_Matrix.csv", write=function(p) write.csv(round(rv$dm,4), p))
+          items$d2heatmap <- list(filename="D2_Heatmap.pdf", write=function(p){
+            pl <- ggplot(reshape2::melt(rv$dm) %>% setNames(c("G1","G2","D")), aes(x=G2,y=G1,fill=D)) + geom_tile(colour="white",linewidth=.3) +
+              scale_fill_gradientn(colours=c("#053061","#2166ac","#d1e5f0","#fddbc7","#d6604d","#67001f"),name="D\u00B2") +
+              labs(title="Mahalanobis D\u00B2 Heatmap",x=NULL,y=NULL) + theme_met() +
+              theme(axis.text.x=element_text(angle=90,vjust=.5,hjust=1,size=7),axis.text.y=element_text(size=7),panel.grid=element_blank())
+            n <- nrow(rv$dm); save_pdf(pl, p, max(8,n*.4), max(7,n*.4))
+          })
+        }
+        if (isTRUE(rv$ran_tocher)) {
+          ci <- active_cluster_info()
+          items$tocher <- list(filename="Tocher_Clusters.csv", write=function(p){ df<-data.frame(Genotype=names(rv$cluster_vec),Cluster=rv$cluster_vec); write.csv(df[order(df$Cluster),],p,row.names=FALSE) })
+          items$cmeans <- list(filename="Cluster_Trait_Means.csv", write=function(p){ d2c<-rv$data2; d2c$Cluster<-rv$cluster_vec[match(as.character(d2c[,1]),names(rv$cluster_vec))]; cm<-aggregate(d2c[,-c(1,ncol(d2c))],by=list(Cluster=d2c$Cluster),mean); nc<-sapply(cm,is.numeric); cm[nc]<-round(cm[nc],4); write.csv(cm[order(cm$Cluster),],p,row.names=FALSE) })
+          items$cdist  <- list(filename="Cluster_Distances.csv", write=function(p){ dm<-as.data.frame(round(ci$dist_m,4)); rownames(dm)<-colnames(dm)<-paste0("C",seq_len(nrow(dm))); write.csv(dm,p) })
+          k<-rv$dendro_k %||% rv$n_clust; pal<-rv$dendro_pal %||% rv$pal; meth<-rv$hc_method_used %||% "ward.D2"
+          items$dendro <- list(filename="Dendrogram.pdf", write=function(p){ cairo_pdf(p,14,8); d2_draw_dendro(rv$dm,k,pal,meth); dev.off() })
+          items$network <- list(filename="Network_Plot.pdf", write=function(p) save_pdf(d2_build_network(ci$dist_m,ci$n_clust,ci$pal,ci$label), p, 10, 10))
+        }
+        if (isTRUE(rv$ran_pca)) {
+          items$eig    <- list(filename="PCA_Eigenvalues.csv", write=function(p) write.csv(round(rv$eig_val,6), p))
+          items$loads  <- list(filename="PCA_Loadings.csv",    write=function(p) write.csv(round(as.data.frame(rv$pca_res$rotation),6), p))
+          items$scores <- list(filename="PCA_Scores.csv",      write=function(p){ df<-cbind(Genotype=rownames(rv$pca_res$x),as.data.frame(round(rv$pca_res$x,6))); write.csv(df,p,row.names=FALSE) })
+          items$scree  <- list(filename="Scree_Plot.pdf",      write=function(p) save_pdf(d2_build_scree(rv$pca_res,rv$eig_val), p, 10, 6))
+          items$biplot <- list(filename="PCA_Biplot.pdf",      write=function(p) save_pdf(d2_build_biplot(rv$pca_res,rv$eig_val), p, 10, 8))
+        }
+        if (isTRUE(rv$ran_corr)) {
+          items$corr     <- list(filename="Correlation_Matrix.csv", write=function(p) write.csv(round(rv$cor_mat,6), p))
+          items$sigpairs <- list(filename="Significant_Pairs.csv",  write=function(p) write.csv(sig_pairs_df(), p, row.names=FALSE))
+          items$corrpdf  <- list(filename="Correlation_Heatmap.pdf", write=function(p){ pl<-d2_build_corr_heatmap(rv$cor_mat,rv$p_mat,input$corr_palette %||% "rwb"); n<-nrow(rv$cor_mat); save_pdf(pl,p,max(7,n*.6),max(6,n*.55)) })
+        }
+        build_zip_export(items, file)
+      },
+      contentType = "application/zip"
+    )
   })
 }
 
@@ -916,235 +1557,252 @@ metUI <- function(id) {
   ns <- NS(id)
   tagList(
     tabItem("met_home",
-      div(class="home-banner", h2("🌾 Multi-Environment Trial Analysis Suite"),
-          p("AMMI · GGE · Stability · ANOVA · Descriptive Statistics"),
-          div(class="vtag","VERSION 2.0 | 2025")),
-      fluidRow(
-        column(4,div(class="feat-card",div(class="fi","📊"),h4("Descriptive Statistics"),p("Summary stats, histograms, boxplots, and interactive GxE heatmaps."))),
-        column(4,div(class="feat-card",div(class="fi","🔬"),h4("ANOVA"),p("Individual + pooled ANOVA, GxE decomposition, Bartlett test."))),
-        column(4,div(class="feat-card",div(class="fi","📉"),h4("9+ Stability Parameters"),p("Annicchiarico, Ecovalence, Shukla, Eberhart-Russell, Lin & Binns, WAASB.")))
-      ), br(),
-      fluidRow(
-        column(4,div(class="feat-card",div(class="fi","🎯"),h4("AMMI Analysis"),p("Full AMMI model, biplots Types 1–3, IPCA significance, ASV index."))),
-        column(4,div(class="feat-card",div(class="fi","🌐"),h4("GGE Biplot"),p("7 GGE biplot types: basic, mean-stability, which-won-where, ranking."))),
-        column(4,div(class="feat-card",div(class="fi","📄"),h4("HD PDF + Excel"),p("Every plot exports as HD PDF. All tables download as Excel.")))
-      )
+            div(class="home-banner", h2("🌾 Multi-Environment Trial Analysis Suite"),
+                p("AMMI · GGE · Stability · ANOVA · Descriptive Statistics"),
+                div(class="vtag","VERSION 2.0 | 2025")),
+            fluidRow(
+              column(4,div(class="feat-card",div(class="fi","📊"),h4("Descriptive Statistics"),p("Summary stats, histograms, boxplots, and interactive GxE heatmaps."))),
+              column(4,div(class="feat-card",div(class="fi","🔬"),h4("ANOVA"),p("Individual + pooled ANOVA, GxE decomposition, Bartlett test."))),
+              column(4,div(class="feat-card",div(class="fi","📉"),h4("9+ Stability Parameters"),p("Annicchiarico, Ecovalence, Shukla, Eberhart-Russell, Lin & Binns, WAASB.")))
+            ), br(),
+            fluidRow(
+              column(4,div(class="feat-card",div(class="fi","🎯"),h4("AMMI Analysis"),p("Full AMMI model, biplots Types 1–3, IPCA significance, ASV index."))),
+              column(4,div(class="feat-card",div(class="fi","🌐"),h4("GGE Biplot"),p("7 GGE biplot types: basic, mean-stability, which-won-where, ranking."))),
+              column(4,div(class="feat-card",div(class="fi","📄"),h4("HD PDF + Excel"),p("Every plot exports as HD PDF. All tables download as Excel.")))
+            )
     ),
     tabItem("met_data",
-      div(class="sec-bar","📂 MET — Data Upload & Inspection"),
-      fluidRow(
-        box(title="Upload & Configure", width=4, status="success", solidHeader=TRUE,
-          fileInput(ns("file1"), "Choose CSV / Excel File", accept=c(".csv",".xlsx",".xls")),
-          hr(), h5(style="color:#1B4332;font-weight:700;","Column Mapping"),
-          uiOutput(ns("ui_env_col")), uiOutput(ns("ui_gen_col")), uiOutput(ns("ui_rep_col")), hr(),
-          actionButton(ns("btn_load"), "⚙️  Load & Process Data", class="btn-success btn-block", icon=icon("play"))
-        ),
-        box(title="Data Exploration", width=8, status="success", solidHeader=TRUE,
-          uiOutput(ns("val_alert_met")),
-          uiOutput(ns("value_boxes")),
-          tabsetPanel(
-            tabPanel("📋 Preview",       br(), DTOutput(ns("tbl_preview"))),
-            tabPanel("🔎 Structure",     br(), verbatimTextOutput(ns("txt_str"))),
-            tabPanel("📦 Outlier Check", dl_bar(ns("dl_plt_outlier")), plotOutput(ns("plt_outlier"), height="340px")),
-            tabPanel("📝 Inspect",       br(), verbatimTextOutput(ns("txt_inspect")))
-          )
-        )
-      )
+            div(class="sec-bar","📂 MET — Data Upload & Inspection"),
+            fluidRow(
+              box(title="Upload & Configure", width=4, status="success", solidHeader=TRUE,
+                  fileInput(ns("file1"), "Choose CSV / Excel File", accept=c(".csv",".xlsx",".xls")),
+                  hr(), h5(style="color:#1B4332;font-weight:700;","Column Mapping"),
+                  uiOutput(ns("ui_env_col")), uiOutput(ns("ui_gen_col")), uiOutput(ns("ui_rep_col")), hr(),
+                  actionButton(ns("btn_load"), "⚙️  Load & Process Data", class="btn-success btn-block", icon=icon("play"))
+              ),
+              box(title="Data Exploration", width=8, status="success", solidHeader=TRUE,
+                  uiOutput(ns("val_alert_met")),
+                  uiOutput(ns("value_boxes")),
+                  tabsetPanel(
+                    tabPanel("📋 Preview",       br(), DTOutput(ns("tbl_preview"))),
+                    tabPanel("🔎 Structure",     br(), verbatimTextOutput(ns("txt_str"))),
+                    tabPanel("📦 Outlier Check", dl_bar(ns("dl_plt_outlier")), plotOutput(ns("plt_outlier"), height="340px")),
+                    tabPanel("📝 Inspect",       br(), verbatimTextOutput(ns("txt_inspect")))
+                  )
+              )
+            )
     ),
     tabItem("met_desc",
-      div(class="sec-bar","📊 MET — Descriptive Statistics"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_desc_var")),
-          actionButton(ns("btn_desc"), "▶  Compute Stats", class="btn-success btn-block", icon=icon("calculator")), hr(),
-          downloadButton(ns("dl_desc"), "⬇  Download Excel", class="btn-warning btn-block")
-        ),
-        box(title="Results", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 Statistics",    br(), DTOutput(ns("tbl_desc"))),
-            tabPanel("📊 Histogram",     dl_bar(ns("dl_plt_hist")),  plotOutput(ns("plt_dist"),    height="400px")),
-            tabPanel("📦 Boxplot by Env",dl_bar(ns("dl_plt_box")),   plotOutput(ns("plt_box_env"), height="400px")),
-            tabPanel("🔥 GxE Heatmap",   dl_bar(ns("dl_plt_heat")),  plotOutput(ns("plt_heat"),    height="400px"))
-          )
-        )
-      )
+            div(class="sec-bar","📊 MET — Descriptive Statistics"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_desc_var")),
+                  actionButton(ns("btn_desc"), "▶  Compute Stats", class="btn-success btn-block", icon=icon("calculator")), hr(),
+                  downloadButton(ns("dl_desc"), "⬇  Download Excel", class="btn-warning btn-block")
+              ),
+              box(title="Results", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 Statistics",    br(), DTOutput(ns("tbl_desc"))),
+                    tabPanel("📊 Histogram",     dl_bar(ns("dl_plt_hist")),  plotOutput(ns("plt_dist"),    height="400px")),
+                    tabPanel("📦 Boxplot by Env",dl_bar(ns("dl_plt_box")),   plotOutput(ns("plt_box_env"), height="400px")),
+                    tabPanel("🔥 GxE Heatmap",   dl_bar(ns("dl_plt_heat")),  plotOutput(ns("plt_heat"),    height="400px"))
+                  )
+              )
+            )
     ),
     tabItem("met_mean",
-      div(class="sec-bar","📈 MET — Mean Performance"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_mean_var")),
-          radioGroupButtons(ns("mean_type"), "Group by:",
-                            choices=c("Genotype"="GEN","Environment"="ENV","GEN × ENV"="GxE"),
-                            selected="GEN", justified=TRUE, size="sm"), br(),
-          actionButton(ns("btn_mean"), "▶  Compute Means", class="btn-success btn-block", icon=icon("calculator")), hr(),
-          downloadButton(ns("dl_mean"), "⬇  Download Excel", class="btn-warning btn-block")
-        ),
-        box(title="Mean Performance", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 Table",   br(), DTOutput(ns("tbl_mean"))),
-            tabPanel("📊 Bar Plot",dl_bar(ns("dl_plt_bar")), plotlyOutput(ns("plt_mean_bar"), height="400px")),
-            tabPanel("📈 GE Plot", dl_bar(ns("dl_plt_ge")),  plotOutput(ns("plt_ge"),         height="400px")),
-            tabPanel("🏆 Winners", br(), DTOutput(ns("tbl_winners")))
-          )
-        )
-      )
+            div(class="sec-bar","📈 MET — Mean Performance"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_mean_var")),
+                  radioGroupButtons(ns("mean_type"), "Group by:",
+                                    choices=c("Genotype"="GEN","Environment"="ENV","GEN × ENV"="GxE"),
+                                    selected="GEN", justified=TRUE, size="sm"), br(),
+                  actionButton(ns("btn_mean"), "▶  Compute Means", class="btn-success btn-block", icon=icon("calculator")), hr(),
+                  downloadButton(ns("dl_mean"), "⬇  Download Excel", class="btn-warning btn-block")
+              ),
+              box(title="Mean Performance", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 Table",   br(), DTOutput(ns("tbl_mean"))),
+                    tabPanel("📊 Bar Plot",dl_bar(ns("dl_plt_bar")), plotlyOutput(ns("plt_mean_bar"), height="400px")),
+                    tabPanel("📈 GE Plot", dl_bar(ns("dl_plt_ge")),  plotOutput(ns("plt_ge"),         height="400px")),
+                    tabPanel("🏆 Winners", br(), DTOutput(ns("tbl_winners")))
+                  )
+              )
+            )
     ),
     tabItem("met_anova",
-      div(class="sec-bar","🔬 MET — Analysis of Variance"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_anova_var")),
-          actionButton(ns("btn_anova"), "▶  Run ANOVA", class="btn-success btn-block", icon=icon("play")), hr(),
-          downloadButton(ns("dl_anova_ind"),  "⬇  Individual ANOVA", class="btn-warning btn-block"), br(),
-          downloadButton(ns("dl_anova_pool"), "⬇  Pooled ANOVA",     class="btn-warning btn-block")
-        ),
-        box(title="ANOVA Results", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 Individual ANOVA", br(), DTOutput(ns("tbl_ind_anova"))),
-            tabPanel("📋 Pooled ANOVA",     br(), DTOutput(ns("tbl_pool_anova"))),
-            tabPanel("🧪 Bartlett Test",    br(), verbatimTextOutput(ns("txt_bartlett")))
-          )
-        )
-      )
+            div(class="sec-bar","🔬 MET — Analysis of Variance"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_anova_var")),
+                  actionButton(ns("btn_anova"), "▶  Run ANOVA", class="btn-success btn-block", icon=icon("play")), hr(),
+                  downloadButton(ns("dl_anova_ind"),  "⬇  Individual ANOVA", class="btn-warning btn-block"), br(),
+                  downloadButton(ns("dl_anova_pool"), "⬇  Pooled ANOVA",     class="btn-warning btn-block")
+              ),
+              box(title="ANOVA Results", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 Individual ANOVA", br(), DTOutput(ns("tbl_ind_anova"))),
+                    tabPanel("📋 Pooled ANOVA",     br(), DTOutput(ns("tbl_pool_anova"))),
+                    tabPanel("🧪 Bartlett Test",    br(), verbatimTextOutput(ns("txt_bartlett")))
+                  )
+              )
+            )
     ),
     tabItem("met_stab_anova",
-      div(class="sec-bar","📉 MET — ANOVA-based Stability"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_stab_anova_var")),
-          actionButton(ns("btn_stab_anova"), "▶  Run Analysis", class="btn-success btn-block", icon=icon("play")), hr(),
-          downloadButton(ns("dl_ann"), "⬇  Annicchiarico", class="btn-warning btn-block"), br(),
-          downloadButton(ns("dl_eco"), "⬇  Ecovalence",    class="btn-warning btn-block"), br(),
-          downloadButton(ns("dl_shk"), "⬇  Shukla",        class="btn-warning btn-block")
-        ),
-        box(title="ANOVA-based Stability", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("Ann. – General",     br(), DTOutput(ns("tbl_ann_gen"))),
-            tabPanel("Ann. – Favorable",   br(), DTOutput(ns("tbl_ann_fav"))),
-            tabPanel("Ann. – Unfavorable", br(), DTOutput(ns("tbl_ann_unf"))),
-            tabPanel("Ecovalence (Wi)",    br(), DTOutput(ns("tbl_eco"))),
-            tabPanel("Shukla Variance",    br(), DTOutput(ns("tbl_shukla"))),
-            tabPanel("📊 Shukla Plot",     dl_bar(ns("dl_plt_shukla")), plotlyOutput(ns("plt_shukla"), height="400px"))
-          )
-        )
-      )
+            div(class="sec-bar","📉 MET — ANOVA-based Stability"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_stab_anova_var")),
+                  actionButton(ns("btn_stab_anova"), "▶  Run Analysis", class="btn-success btn-block", icon=icon("play")), hr(),
+                  downloadButton(ns("dl_ann"), "⬇  Annicchiarico", class="btn-warning btn-block"), br(),
+                  downloadButton(ns("dl_eco"), "⬇  Ecovalence",    class="btn-warning btn-block"), br(),
+                  downloadButton(ns("dl_shk"), "⬇  Shukla",        class="btn-warning btn-block")
+              ),
+              box(title="ANOVA-based Stability", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("Ann. – General",     br(), DTOutput(ns("tbl_ann_gen"))),
+                    tabPanel("Ann. – Favorable",   br(), DTOutput(ns("tbl_ann_fav"))),
+                    tabPanel("Ann. – Unfavorable", br(), DTOutput(ns("tbl_ann_unf"))),
+                    tabPanel("Ecovalence (Wi)",    br(), DTOutput(ns("tbl_eco"))),
+                    tabPanel("Shukla Variance",    br(), DTOutput(ns("tbl_shukla"))),
+                    tabPanel("📊 Shukla Plot",     dl_bar(ns("dl_plt_shukla")), plotlyOutput(ns("plt_shukla"), height="400px"))
+                  )
+              )
+            )
     ),
     tabItem("met_stab_reg",
-      div(class="sec-bar","📈 MET — Regression Stability (Eberhart-Russell)"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_stab_reg_var")),
-          actionButton(ns("btn_stab_reg"), "▶  Run Regression", class="btn-success btn-block", icon=icon("play")), hr(),
-          downloadButton(ns("dl_stab_reg"), "⬇  Download ANOVA", class="btn-warning btn-block")
-        ),
-        box(title="Regression Stability", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 ANOVA",          br(), DTOutput(ns("tbl_reg_anova"))),
-            tabPanel("📊 Regression Plot",dl_bar(ns("dl_plt_reg")), plotOutput(ns("plt_reg"), height="460px"))
-          )
-        )
-      )
+            div(class="sec-bar","📈 MET — Regression Stability (Eberhart-Russell)"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_stab_reg_var")),
+                  actionButton(ns("btn_stab_reg"), "▶  Run Regression", class="btn-success btn-block", icon=icon("play")), hr(),
+                  downloadButton(ns("dl_stab_reg"), "⬇  Download ANOVA", class="btn-warning btn-block")
+              ),
+              box(title="Regression Stability", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 ANOVA",          br(), DTOutput(ns("tbl_reg_anova"))),
+                    tabPanel("📊 Regression Plot",dl_bar(ns("dl_plt_reg")), plotOutput(ns("plt_reg"), height="460px"))
+                  )
+              )
+            )
     ),
     tabItem("met_stab_np",
-      div(class="sec-bar","🔢 MET — Non-parametric Stability"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_stab_np_var")),
-          actionButton(ns("btn_stab_np"), "▶  Run Analysis", class="btn-success btn-block", icon=icon("play")), hr(),
-          downloadButton(ns("dl_super"), "⬇  Superiority", class="btn-warning btn-block"), br(),
-          downloadButton(ns("dl_fox"),   "⬇  Fox Index",   class="btn-warning btn-block")
-        ),
-        box(title="Non-parametric Results", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("Lin & Binns",     br(), DTOutput(ns("tbl_superiority"))),
-            tabPanel("Fox Top-Third",   br(), DTOutput(ns("tbl_fox"))),
-            tabPanel("📊 Superiority Plot", dl_bar(ns("dl_plt_np")), plotlyOutput(ns("plt_np"), height="400px"))
-          )
-        )
-      )
+            div(class="sec-bar","🔢 MET — Non-parametric Stability"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_stab_np_var")),
+                  actionButton(ns("btn_stab_np"), "▶  Run Analysis", class="btn-success btn-block", icon=icon("play")), hr(),
+                  downloadButton(ns("dl_super"), "⬇  Superiority", class="btn-warning btn-block"), br(),
+                  downloadButton(ns("dl_fox"),   "⬇  Fox Index",   class="btn-warning btn-block")
+              ),
+              box(title="Non-parametric Results", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("Lin & Binns",     br(), DTOutput(ns("tbl_superiority"))),
+                    tabPanel("Fox Top-Third",   br(), DTOutput(ns("tbl_fox"))),
+                    tabPanel("📊 Superiority Plot", dl_bar(ns("dl_plt_np")), plotlyOutput(ns("plt_np"), height="400px"))
+                  )
+              )
+            )
     ),
     tabItem("met_stab_fa",
-      div(class="sec-bar","🔠 MET — Factor Analysis of GE"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_stab_fa_var")),
-          actionButton(ns("btn_stab_fa"), "▶  Run Factor Analysis", class="btn-success btn-block", icon=icon("play")), hr(),
-          downloadButton(ns("dl_fa"), "⬇  Download Results", class="btn-warning btn-block")
-        ),
-        box(title="Factor Analysis", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("Genotype Scores",  br(), DTOutput(ns("tbl_fa_scores"))),
-            tabPanel("Rotated Loadings", br(), DTOutput(ns("tbl_fa_loads"))),
-            tabPanel("PCA Eigenvalues",  br(), DTOutput(ns("tbl_fa_pca"))),
-            tabPanel("📊 Factor Biplot", dl_bar(ns("dl_plt_fa")), plotOutput(ns("plt_fa"), height="460px"))
-          )
-        )
-      )
+            div(class="sec-bar","🔠 MET — Factor Analysis of GE"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_stab_fa_var")),
+                  actionButton(ns("btn_stab_fa"), "▶  Run Factor Analysis", class="btn-success btn-block", icon=icon("play")), hr(),
+                  downloadButton(ns("dl_fa"), "⬇  Download Results", class="btn-warning btn-block")
+              ),
+              box(title="Factor Analysis", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("Genotype Scores",  br(), DTOutput(ns("tbl_fa_scores"))),
+                    tabPanel("Rotated Loadings", br(), DTOutput(ns("tbl_fa_loads"))),
+                    tabPanel("PCA Eigenvalues",  br(), DTOutput(ns("tbl_fa_pca"))),
+                    tabPanel("📊 Factor Biplot", dl_bar(ns("dl_plt_fa")), plotOutput(ns("plt_fa"), height="460px"))
+                  )
+              )
+            )
     ),
     tabItem("met_stab_wrap",
-      div(class="sec-bar","🎁 MET — Comprehensive Stability (ge_stats)"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_wrap_var")),
-          actionButton(ns("btn_wrap"), "▶  Compute All", class="btn-success btn-block", icon=icon("cogs")), hr(),
-          downloadButton(ns("dl_wrap"),      "⬇  All Parameters", class="btn-warning btn-block"), br(),
-          downloadButton(ns("dl_wrap_rank"), "⬇  Rankings",       class="btn-warning btn-block")
-        ),
-        box(title="All Stability Parameters", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 Parameters", br(), DTOutput(ns("tbl_wrap"))),
-            tabPanel("🏆 Rankings",   br(), DTOutput(ns("tbl_wrap_rank"))),
-            tabPanel("🔗 Correlation Heatmap", dl_bar(ns("dl_plt_cor")), plotOutput(ns("plt_wrap_cor"), height="480px"))
-          )
-        )
-      )
+            div(class="sec-bar","🎁 MET — Comprehensive Stability (ge_stats)"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_wrap_var")),
+                  actionButton(ns("btn_wrap"), "▶  Compute All", class="btn-success btn-block", icon=icon("cogs")), hr(),
+                  downloadButton(ns("dl_wrap"),      "⬇  All Parameters", class="btn-warning btn-block"), br(),
+                  downloadButton(ns("dl_wrap_rank"), "⬇  Rankings",       class="btn-warning btn-block")
+              ),
+              box(title="All Stability Parameters", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 Parameters", br(), DTOutput(ns("tbl_wrap"))),
+                    tabPanel("🏆 Rankings",   br(), DTOutput(ns("tbl_wrap_rank"))),
+                    tabPanel("🔗 Correlation Heatmap", dl_bar(ns("dl_plt_cor")), plotOutput(ns("plt_wrap_cor"), height="480px"))
+                  )
+              )
+            )
     ),
     tabItem("met_ammi",
-      div(class="sec-bar","🎯 MET — AMMI Analysis"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_ammi_var")),
-          numericInput(ns("ammi_naxis"), "IPCA axes:", 2, min=1, max=10),
-          actionButton(ns("btn_ammi"), "▶  Run AMMI", class="btn-success btn-block", icon=icon("play")), hr(),
-          downloadButton(ns("dl_ammi_anova"), "⬇  ANOVA",      class="btn-warning btn-block"), br(),
-          downloadButton(ns("dl_ammi_idx"),   "⬇  AMMI Index", class="btn-warning btn-block")
-        ),
-        box(title="AMMI Results", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 ANOVA",             br(), DTOutput(ns("tbl_ammi_anova"))),
-            tabPanel("📋 IPCA Sig.",          br(), DTOutput(ns("tbl_ipca"))),
-            tabPanel("📊 Biplot Type 1",      dl_bar(ns("dl_plt_ammi1")), plotOutput(ns("plt_ammi1"), height="450px")),
-            tabPanel("📊 Biplot Type 2",      dl_bar(ns("dl_plt_ammi2")), plotOutput(ns("plt_ammi2"), height="450px")),
-            tabPanel("📊 Y × WAAS Biplot",    dl_bar(ns("dl_plt_waas")),  plotOutput(ns("plt_waas"),  height="450px")),
-            tabPanel("📋 AMMI Index",          br(), DTOutput(ns("tbl_ammi_idx")))
-          )
-        )
-      )
+            div(class="sec-bar","🎯 MET — AMMI Analysis"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_ammi_var")),
+                  numericInput(ns("ammi_naxis"), "IPCA axes:", 2, min=1, max=10),
+                  actionButton(ns("btn_ammi"), "▶  Run AMMI", class="btn-success btn-block", icon=icon("play")), hr(),
+                  downloadButton(ns("dl_ammi_anova"), "⬇  ANOVA",      class="btn-warning btn-block"), br(),
+                  downloadButton(ns("dl_ammi_idx"),   "⬇  AMMI Index", class="btn-warning btn-block")
+              ),
+              box(title="AMMI Results", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 ANOVA",             br(), DTOutput(ns("tbl_ammi_anova"))),
+                    tabPanel("📋 IPCA Sig.",          br(), DTOutput(ns("tbl_ipca"))),
+                    tabPanel("📊 Biplot Type 1",      dl_bar(ns("dl_plt_ammi1")), plotOutput(ns("plt_ammi1"), height="450px")),
+                    tabPanel("📊 Biplot Type 2",      dl_bar(ns("dl_plt_ammi2")), plotOutput(ns("plt_ammi2"), height="450px")),
+                    tabPanel("📊 Y × WAAS Biplot",    dl_bar(ns("dl_plt_waas")),  plotOutput(ns("plt_waas"),  height="450px")),
+                    tabPanel("📋 AMMI Index",          br(), DTOutput(ns("tbl_ammi_idx")))
+                  )
+              )
+            )
     ),
     tabItem("met_gge",
-      div(class="sec-bar","🌐 MET — GGE Biplot Analysis"),
-      fluidRow(
-        box(title="Options", width=3, status="success", solidHeader=TRUE,
-          uiOutput(ns("ui_gge_var")),
-          selectInput(ns("gge_svp"), "SVP:",
-                      choices=c("Environment"="environment","Genotype"="genotype","Symmetrical"="symmetrical"),
-                      selected="symmetrical"),
-          actionButton(ns("btn_gge"), "▶  Run GGE", class="btn-success btn-block", icon=icon("play")), hr(),
-          downloadButton(ns("dl_gge"), "⬇  Predictions", class="btn-warning btn-block")
-        ),
-        box(title="GGE Biplots", width=9, status="success", solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("Basic Biplot",           dl_bar(ns("dl_plt_gge1")), plotOutput(ns("plt_gge1"), height="440px")),
-            tabPanel("Mean vs Stability",      dl_bar(ns("dl_plt_gge2")), plotOutput(ns("plt_gge2"), height="440px")),
-            tabPanel("Which-Won-Where",        dl_bar(ns("dl_plt_gge3")), plotOutput(ns("plt_gge3"), height="440px")),
-            tabPanel("Discrim. vs Repres.",    dl_bar(ns("dl_plt_gge4")), plotOutput(ns("plt_gge4"), height="440px")),
-            tabPanel("Ranking Genotypes",      dl_bar(ns("dl_plt_gge5")), plotOutput(ns("plt_gge5"), height="440px")),
-            tabPanel("Ranking Environments",   dl_bar(ns("dl_plt_gge6")), plotOutput(ns("plt_gge6"), height="440px")),
-            tabPanel("Relation Environments",  dl_bar(ns("dl_plt_gge7")), plotOutput(ns("plt_gge7"), height="440px"))
-          )
-        )
-      )
+            div(class="sec-bar","🌐 MET — GGE Biplot Analysis"),
+            fluidRow(
+              box(title="Options", width=3, status="success", solidHeader=TRUE,
+                  uiOutput(ns("ui_gge_var")),
+                  selectInput(ns("gge_svp"), "SVP:",
+                              choices=c("Environment"="environment","Genotype"="genotype","Symmetrical"="symmetrical"),
+                              selected="symmetrical"),
+                  actionButton(ns("btn_gge"), "▶  Run GGE", class="btn-success btn-block", icon=icon("play")), hr(),
+                  downloadButton(ns("dl_gge"), "⬇  Predictions", class="btn-warning btn-block")
+              ),
+              box(title="GGE Biplots", width=9, status="success", solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("Basic Biplot",           dl_bar(ns("dl_plt_gge1")), plotOutput(ns("plt_gge1"), height="440px")),
+                    tabPanel("Mean vs Stability",      dl_bar(ns("dl_plt_gge2")), plotOutput(ns("plt_gge2"), height="440px")),
+                    tabPanel("Which-Won-Where",        dl_bar(ns("dl_plt_gge3")), plotOutput(ns("plt_gge3"), height="440px")),
+                    tabPanel("Discrim. vs Repres.",    dl_bar(ns("dl_plt_gge4")), plotOutput(ns("plt_gge4"), height="440px")),
+                    tabPanel("Ranking Genotypes",      dl_bar(ns("dl_plt_gge5")), plotOutput(ns("plt_gge5"), height="440px")),
+                    tabPanel("Ranking Environments",   dl_bar(ns("dl_plt_gge6")), plotOutput(ns("plt_gge6"), height="440px")),
+                    tabPanel("Relation Environments",  dl_bar(ns("dl_plt_gge7")), plotOutput(ns("plt_gge7"), height="440px"))
+                  )
+              )
+            )
+    ),
+    # ── Export ──────────────────────────────────────────────
+    tabItem("met_export",
+            div(class="sec-bar","📦 MET — Export Results"),
+            fluidRow(
+              box(title="Download All (ZIP)", width=12, status="success", solidHeader=TRUE,
+                  p(style="color:#555;font-size:12px;",
+                    "Bundles every table (Excel) and plot (PDF) from the analyses you have actually run in this session \u2014 ",
+                    "nothing else is included, and nothing here is run automatically."),
+                  downloadButton(ns("dl_all_zip"), "\U0001F4E6  Download All Results (.zip)", class="btn-success", style="font-size:14px;padding:10px 18px;")
+              )
+            ),
+            fluidRow(
+              box(title="Analysis Status", width=12, status="success", solidHeader=TRUE,
+                  uiOutput(ns("export_status_ui"))
+              )
+            )
     )
   )
 }
@@ -1156,10 +1814,10 @@ metServer <- function(id) {
   moduleServer(id, function(input, output, session) {
     raw_data       <- reactiveVal(NULL)
     processed_data <- reactiveVal(NULL)
-
+    
     met_valmsg <- reactiveVal(NULL)
     output$val_alert_met <- renderUI({ met_valmsg() })
-
+    
     observeEvent(input$file1, {
       met_valmsg(NULL)
       req(input$file1)
@@ -1171,7 +1829,7 @@ metServer <- function(id) {
       }
       raw_data(r$data)
     })
-
+    
     observe({
       req(raw_data()); cols <- names(raw_data())
       g <- function(p) grep(p,cols,ignore.case=TRUE,value=TRUE)[1] %||% cols[1]
@@ -1179,7 +1837,7 @@ metServer <- function(id) {
       output$ui_gen_col <- renderUI(selectInput(session$ns("gen_col"),"GEN column:",cols,selected=g("^GEN$|geno")))
       output$ui_rep_col <- renderUI(selectInput(session$ns("rep_col"),"REP column:",cols,selected=g("^REP$|repli|block")))
     })
-
+    
     observeEvent(input$btn_load, {
       met_valmsg(NULL); processed_data(NULL)
       req(raw_data(), input$env_col, input$gen_col, input$rep_col)
@@ -1219,9 +1877,9 @@ metServer <- function(id) {
       else
         showNotification("\u2705 MET data loaded and validated!", type="message", duration=3)
     })
-
+    
     resp_vars <- reactive({ req(processed_data()); setdiff(names(processed_data()), c("ENV","GEN","REP")) })
-
+    
     output$value_boxes <- renderUI({
       req(processed_data()); df <- processed_data()
       fluidRow(
@@ -1236,7 +1894,7 @@ metServer <- function(id) {
     output$txt_inspect <- renderPrint({ req(processed_data()); tryCatch(inspect(processed_data()), error=function(e) cat("Error:",e$message)) })
     output$plt_outlier <- renderPlot({ req(processed_data(),resp_vars()); v <- sym(resp_vars()[1]); tryCatch(find_outliers(processed_data(),var=!!v,plots=TRUE), error=function(e){ plot.new(); title(paste("Error:",e$message)) }) })
     output$dl_plt_outlier <- downloadHandler(paste0("outlier_",Sys.Date(),".pdf"), function(f){ req(processed_data(),resp_vars()); v<-sym(resp_vars()[1]); cairo_pdf(f,14,9); tryCatch(find_outliers(processed_data(),var=!!v,plots=TRUE),error=function(e){plot.new();title(e$message)}); dev.off() })
-
+    
     mk_sel <- function(input_id) renderUI({ req(resp_vars()); selectInput(session$ns(input_id),"Response variable:",choices=resp_vars()) })
     output$ui_desc_var       <- mk_sel("desc_var")
     output$ui_mean_var       <- mk_sel("mean_var")
@@ -1248,31 +1906,31 @@ metServer <- function(id) {
     output$ui_wrap_var       <- mk_sel("wrap_var")
     output$ui_ammi_var       <- mk_sel("ammi_var")
     output$ui_gge_var        <- mk_sel("gge_var")
-
+    
     # Descriptive
     desc_r <- eventReactive(input$btn_desc, { req(processed_data()); tryCatch(desc_stat(processed_data(),stats="all"),error=function(e) NULL) })
     output$tbl_desc <- renderDT({ req(desc_r()); fmt_dt(as.data.frame(desc_r())) })
     output$dl_desc  <- downloadHandler(paste0("descriptive_",Sys.Date(),".xlsx"), function(f){ req(desc_r()); write_xlsx(as.data.frame(desc_r()),f) })
-
+    
     r_plt_hist <- reactive({ req(processed_data(),input$desc_var); df<-processed_data(); vs<-sym(input$desc_var)
-      ggplot(df,aes(x=!!vs,fill=ENV))+geom_histogram(alpha=.75,bins=20,color="white",linewidth=.3)+scale_fill_manual(values=MET_COLORS)+facet_wrap(~ENV,scales="free_y")+labs(title=paste("Distribution of",input$desc_var),x=input$desc_var,y="Count")+theme_met()+theme(legend.position="none") })
+    ggplot(df,aes(x=!!vs,fill=ENV))+geom_histogram(alpha=.75,bins=20,color="white",linewidth=.3)+scale_fill_manual(values=MET_COLORS)+facet_wrap(~ENV,scales="free_y")+labs(title=paste("Distribution of",input$desc_var),x=input$desc_var,y="Count")+theme_met()+theme(legend.position="none") })
     output$plt_dist   <- renderPlot({ req(r_plt_hist()); r_plt_hist() })
     output$dl_plt_hist <- downloadHandler(paste0("histogram_",Sys.Date(),".pdf"), function(f){ req(r_plt_hist()); save_pdf(r_plt_hist(),f,16,11) })
-
+    
     r_plt_box <- reactive({ req(processed_data(),input$desc_var); df<-processed_data(); vs<-sym(input$desc_var)
-      ggplot(df,aes(x=ENV,y=!!vs,fill=ENV))+geom_boxplot(alpha=.8,outlier.color="#C62828")+geom_jitter(width=.15,alpha=.3,size=.8)+scale_fill_manual(values=MET_COLORS)+labs(title=paste("Boxplot of",input$desc_var),x="Environment",y=input$desc_var)+theme_met()+theme(legend.position="none",axis.text.x=element_text(angle=45,hjust=1)) })
+    ggplot(df,aes(x=ENV,y=!!vs,fill=ENV))+geom_boxplot(alpha=.8,outlier.color="#C62828")+geom_jitter(width=.15,alpha=.3,size=.8)+scale_fill_manual(values=MET_COLORS)+labs(title=paste("Boxplot of",input$desc_var),x="Environment",y=input$desc_var)+theme_met()+theme(legend.position="none",axis.text.x=element_text(angle=45,hjust=1)) })
     output$plt_box_env <- renderPlot({ req(r_plt_box()); r_plt_box() })
     output$dl_plt_box  <- downloadHandler(paste0("boxplot_",Sys.Date(),".pdf"), function(f){ req(r_plt_box()); save_pdf(r_plt_box(),f,16,10) })
-
+    
     r_plt_heat <- reactive({ req(processed_data(),input$desc_var); df<-processed_data(); vs<-sym(input$desc_var)
-      gm <- df %>% group_by(ENV,GEN) %>% summarise(m=mean(!!vs,na.rm=TRUE),.groups="drop")
-      ggplot(gm,aes(x=ENV,y=GEN,fill=m))+geom_tile(color="white",linewidth=.5)+
-        scale_fill_gradientn(colors=c("#1B4332","#40916C","#95D5B2","#FFFDE7","#F4A300","#C62828"),name=input$desc_var)+
-        geom_text(aes(label=round(m,1)),size=3,color="white",fontface="bold")+
-        labs(title=paste("GxE Heatmap –",input$desc_var),x="Environment",y="Genotype")+theme_met()+theme(axis.text.x=element_text(angle=45,hjust=1)) })
+    gm <- df %>% group_by(ENV,GEN) %>% summarise(m=mean(!!vs,na.rm=TRUE),.groups="drop")
+    ggplot(gm,aes(x=ENV,y=GEN,fill=m))+geom_tile(color="white",linewidth=.5)+
+      scale_fill_gradientn(colors=c("#1B4332","#40916C","#95D5B2","#FFFDE7","#F4A300","#C62828"),name=input$desc_var)+
+      geom_text(aes(label=round(m,1)),size=3,color="white",fontface="bold")+
+      labs(title=paste("GxE Heatmap –",input$desc_var),x="Environment",y="Genotype")+theme_met()+theme(axis.text.x=element_text(angle=45,hjust=1)) })
     output$plt_heat   <- renderPlot({ req(r_plt_heat()); r_plt_heat() })
     output$dl_plt_heat <- downloadHandler(paste0("GxE_heatmap_",Sys.Date(),".pdf"), function(f){ req(r_plt_heat()); save_pdf(r_plt_heat(),f,16,12) })
-
+    
     # Mean Performance
     mean_r <- eventReactive(input$btn_mean, {
       req(processed_data(),input$mean_var,input$mean_type); df<-processed_data(); vs<-sym(input$mean_var)
@@ -1282,23 +1940,23 @@ metServer <- function(id) {
     })
     output$tbl_mean <- renderDT({ req(mean_r()); fmt_dt(as.data.frame(mean_r())) })
     output$dl_mean  <- downloadHandler(paste0("means_",Sys.Date(),".xlsx"), function(f){ req(mean_r()); write_xlsx(as.data.frame(mean_r()),f) })
-
+    
     r_plt_bar <- reactive({ req(mean_r(),input$mean_var); df<-as.data.frame(mean_r())
-      gc <- if (input$mean_type %in% c("GEN","GxE")) "GEN" else "ENV"
-      vc <- if (input$mean_var %in% names(df)) input$mean_var else names(df)[which(sapply(df,is.numeric))[1]]
-      req(gc %in% names(df), vc %in% names(df))
-      ggplot(df,aes(x=reorder(.data[[gc]],-.data[[vc]]),y=.data[[vc]],fill=.data[[gc]]))+geom_col(color="white",linewidth=.3)+scale_fill_manual(values=MET_COLORS)+labs(title=paste("Mean",vc,"by",gc),x=gc,y=vc)+theme_met()+theme(axis.text.x=element_text(angle=45,hjust=1),legend.position="none") })
+    gc <- if (input$mean_type %in% c("GEN","GxE")) "GEN" else "ENV"
+    vc <- if (input$mean_var %in% names(df)) input$mean_var else names(df)[which(sapply(df,is.numeric))[1]]
+    req(gc %in% names(df), vc %in% names(df))
+    ggplot(df,aes(x=reorder(.data[[gc]],-.data[[vc]]),y=.data[[vc]],fill=.data[[gc]]))+geom_col(color="white",linewidth=.3)+scale_fill_manual(values=MET_COLORS)+labs(title=paste("Mean",vc,"by",gc),x=gc,y=vc)+theme_met()+theme(axis.text.x=element_text(angle=45,hjust=1),legend.position="none") })
     output$plt_mean_bar <- renderPlotly({ req(r_plt_bar()); ggplotly(r_plt_bar(),tooltip=c("x","y")) })
     output$dl_plt_bar   <- downloadHandler(paste0("barplot_",Sys.Date(),".pdf"), function(f){ req(r_plt_bar()); save_pdf(r_plt_bar(),f,16,10) })
-
+    
     r_plt_ge <- reactive({ req(processed_data(),input$mean_var); df<-processed_data(); vs<-sym(input$mean_var)
-      top_g <- df %>% group_by(GEN) %>% summarise(mv=mean(!!vs,na.rm=TRUE),.groups="drop") %>% slice_max(mv,n=min(15,nlevels(df$GEN)))
-      df_s  <- df %>% filter(GEN %in% top_g$GEN)
-      ge_plot(df_s,ENV,GEN,!!vs)+theme_met()+labs(title=paste("GE Plot –",input$mean_var)) })
+    top_g <- df %>% group_by(GEN) %>% summarise(mv=mean(!!vs,na.rm=TRUE),.groups="drop") %>% slice_max(mv,n=min(15,nlevels(df$GEN)))
+    df_s  <- df %>% filter(GEN %in% top_g$GEN)
+    ge_plot(df_s,ENV,GEN,!!vs)+theme_met()+labs(title=paste("GE Plot –",input$mean_var)) })
     output$plt_ge    <- renderPlot({ req(r_plt_ge()); r_plt_ge() })
     output$dl_plt_ge <- downloadHandler(paste0("GE_plot_",Sys.Date(),".pdf"), function(f){ req(r_plt_ge()); save_pdf(r_plt_ge(),f,16,10) })
     output$tbl_winners <- renderDT({ req(processed_data(),input$mean_var); vs<-sym(input$mean_var); tryCatch({ w<-ge_winners(processed_data(),ENV,GEN,resp=!!vs); fmt_dt(as.data.frame(w)) },error=function(e) datatable(data.frame(Message=paste("Error:",e$message)))) })
-
+    
     # ANOVA
     anova_r <- eventReactive(input$btn_anova, {
       req(processed_data(),input$anova_var); df<-processed_data(); vs<-sym(input$anova_var)
@@ -1311,7 +1969,7 @@ metServer <- function(id) {
     output$txt_bartlett   <- renderPrint({ req(anova_r()); print(anova_r()$bart) })
     output$dl_anova_ind   <- downloadHandler(paste0("ind_anova_",Sys.Date(),".xlsx"), function(f){ req(anova_r()); v<-input$anova_var; write_xlsx(tryCatch(safe_df(anova_r()$ind[[v]]$individual),error=function(e)data.frame()),f) })
     output$dl_anova_pool  <- downloadHandler(paste0("pool_anova_",Sys.Date(),".xlsx"), function(f){ req(anova_r()); v<-input$anova_var; write_xlsx(tryCatch(safe_df(anova_r()$pool[[v]]$anova),error=function(e)data.frame()),f) })
-
+    
     # Stability ANOVA-based
     sa_r <- eventReactive(input$btn_stab_anova, {
       req(processed_data(),input$stab_anova_var); df<-processed_data(); vs<-sym(input$stab_anova_var)
@@ -1320,30 +1978,30 @@ metServer <- function(id) {
            shukla=tryCatch(Shukla(df,ENV,GEN,REP,!!vs),error=function(e)NULL))
     })
     ann_tab <- function(part) renderDT({ req(sa_r()); v<-input$stab_anova_var
-      df <- tryCatch({ sub<-sa_r()$ann; x<-if(v %in% names(sub)) sub[[v]][[part]] else sub[[part]]; data.frame(as.list(x),check.names=FALSE,stringsAsFactors=FALSE) },error=function(e) data.frame(Error=e$message)); fmt_dt(df) })
+    df <- tryCatch({ sub<-sa_r()$ann; x<-if(v %in% names(sub)) sub[[v]][[part]] else sub[[part]]; data.frame(as.list(x),check.names=FALSE,stringsAsFactors=FALSE) },error=function(e) data.frame(Error=e$message)); fmt_dt(df) })
     output$tbl_ann_gen <- ann_tab("general"); output$tbl_ann_fav <- ann_tab("favorable"); output$tbl_ann_unf <- ann_tab("unfavorable")
     output$tbl_eco    <- renderDT({ req(sa_r()); fmt_dt(tryCatch(metan_df(sa_r()$eco,input$stab_anova_var),error=function(e)data.frame(Error=e$message))) })
     output$tbl_shukla <- renderDT({ req(sa_r()); fmt_dt(tryCatch(metan_df(sa_r()$shukla,input$stab_anova_var),error=function(e)data.frame(Error=e$message))) })
     r_plt_shukla <- reactive({ req(sa_r()); v<-input$stab_anova_var; df<-tryCatch(metan_df(sa_r()$shukla,v),error=function(e)NULL); req(!is.null(df),"GEN" %in% names(df))
-      vc<-grep("ShuklaVar|Shukla|shukla|s2_i|Wi|var_i",names(df),value=TRUE,ignore.case=TRUE)[1]
-      if(is.na(vc)||is.null(vc)) vc<-names(df)[which(sapply(df,is.numeric)&names(df)!="Y")][1]; req(!is.na(vc))
-      ggplot(df,aes(x=reorder(GEN,.data[[vc]]),y=.data[[vc]],fill=.data[[vc]]))+geom_col(color="white",linewidth=.3)+coord_flip()+scale_fill_gradientn(colors=c("#2D6A4F","#95D5B2","#F4A300","#C62828"),name="Value")+labs(title="Shukla Variance by Genotype",subtitle="Lower = more stable",x="Genotype",y="Shukla Variance")+theme_met() })
+    vc<-grep("ShuklaVar|Shukla|shukla|s2_i|Wi|var_i",names(df),value=TRUE,ignore.case=TRUE)[1]
+    if(is.na(vc)||is.null(vc)) vc<-names(df)[which(sapply(df,is.numeric)&names(df)!="Y")][1]; req(!is.na(vc))
+    ggplot(df,aes(x=reorder(GEN,.data[[vc]]),y=.data[[vc]],fill=.data[[vc]]))+geom_col(color="white",linewidth=.3)+coord_flip()+scale_fill_gradientn(colors=c("#2D6A4F","#95D5B2","#F4A300","#C62828"),name="Value")+labs(title="Shukla Variance by Genotype",subtitle="Lower = more stable",x="Genotype",y="Shukla Variance")+theme_met() })
     output$plt_shukla    <- renderPlotly({ req(r_plt_shukla()); ggplotly(r_plt_shukla()) })
     output$dl_plt_shukla <- downloadHandler(paste0("shukla_",Sys.Date(),".pdf"), function(f){ req(r_plt_shukla()); save_pdf(r_plt_shukla(),f,14,10) })
     output$dl_ann <- downloadHandler(paste0("annicchiarico_",Sys.Date(),".xlsx"), function(f){ req(sa_r()); v<-input$stab_anova_var; r<-sa_r()$ann; req(r); sub<-if(!is.null(v)&&v %in% names(r)) r[[v]] else r; mk<-function(pt) tryCatch({x<-sub[[pt]];data.frame(as.list(x),check.names=FALSE,stringsAsFactors=FALSE)},error=function(e)data.frame(Info=paste(pt,"not available"))); write_xlsx(list(General=mk("general"),Favorable=mk("favorable"),Unfavorable=mk("unfavorable")),f) })
     output$dl_eco <- downloadHandler(paste0("ecovalence_",Sys.Date(),".xlsx"), function(f){ req(sa_r()); write_xlsx(tryCatch(metan_df(sa_r()$eco,input$stab_anova_var),error=function(e)data.frame(Error=e$message)),f) })
     output$dl_shk <- downloadHandler(paste0("shukla_",Sys.Date(),".xlsx"),     function(f){ req(sa_r()); write_xlsx(tryCatch(metan_df(sa_r()$shukla,input$stab_anova_var),error=function(e)data.frame(Error=e$message)),f) })
-
+    
     # Stability Regression
     sr_r <- eventReactive(input$btn_stab_reg, { req(processed_data(),input$stab_reg_var); vs<-sym(input$stab_reg_var); tryCatch(ge_reg(processed_data(),ENV,GEN,REP,!!vs),error=function(e)NULL) })
     output$tbl_reg_anova <- renderDT({ req(sr_r()); v<-input$stab_reg_var; fmt_dt(tryCatch(safe_df(sr_r()[[v]]$anova),error=function(e)data.frame(Error=e$message))) })
     output$plt_reg       <- renderPlot({ req(sr_r()); tryCatch(plot(sr_r()),error=function(e) ggplot()+annotate("text",x=.5,y=.5,label=e$message)+theme_void()) })
     output$dl_plt_reg    <- downloadHandler(paste0("reg_plot_",Sys.Date(),".pdf"), function(f){ req(sr_r()); cairo_pdf(f,16,10); tryCatch(plot(sr_r()),error=function(e){plot.new();title(e$message)}); dev.off() })
     output$dl_stab_reg   <- downloadHandler(paste0("reg_anova_",Sys.Date(),".xlsx"), function(f){ req(sr_r()); v<-input$stab_reg_var; write_xlsx(tryCatch(safe_df(sr_r()[[v]]$anova),error=function(e)data.frame()),f) })
-
+    
     # Stability Non-parametric
     np_r <- eventReactive(input$btn_stab_np, { req(processed_data(),input$stab_np_var); df<-processed_data(); vs<-sym(input$stab_np_var)
-      list(super=tryCatch(superiority(df,ENV,GEN,!!vs),error=function(e)NULL), fox=tryCatch(Fox(df,ENV,GEN,!!vs),error=function(e)NULL)) })
+    list(super=tryCatch(superiority(df,ENV,GEN,!!vs),error=function(e)NULL), fox=tryCatch(Fox(df,ENV,GEN,!!vs),error=function(e)NULL)) })
     output$tbl_superiority <- renderDT({ req(np_r()); fmt_dt(tryCatch(metan_df(np_r()$super,input$stab_np_var),error=function(e)data.frame(Error=e$message))) })
     output$tbl_fox         <- renderDT({ req(np_r()); fmt_dt(tryCatch(metan_df(np_r()$fox,input$stab_np_var),error=function(e)data.frame(Error=e$message))) })
     r_plt_np <- reactive({
@@ -1354,13 +2012,25 @@ metServer <- function(id) {
       gen_col <- grep("^gen$", names(df), ignore.case=TRUE, value=TRUE)[1]
       req(!is.na(gen_col))
       if (gen_col != "GEN") names(df)[names(df)==gen_col] <- "GEN"
-      vc <- grep("^Pi_a$|^Pi$|^W_i$|^Pi_f$|^Pi_u$|general", names(df), value=TRUE, ignore.case=TRUE)[1]
-      if (is.na(vc)||is.null(vc)) vc <- names(df)[which(sapply(df, is.numeric))][1]
-      req(!is.na(vc))
+      vc <- NULL
+      for (pat in c("^Pi_a$","^Pi$","^W_i$","^Pi_f$","^Pi_u$","general")) {
+        hit <- grep(pat, names(df), value=TRUE, ignore.case=TRUE)[1]
+        if (!is.na(hit) && is.numeric(df[[hit]])) { vc <- hit; break }
+      }
+      if (is.null(vc)) vc <- names(df)[which(sapply(df, is.numeric))][1]
+      req(!is.na(vc), !is.null(vc))
       ggplot(df, aes(x=reorder(GEN, -.data[[vc]]), y=.data[[vc]], fill=.data[[vc]])) +
         geom_col(color="white", linewidth=.3) +
         coord_flip() +
-        scale_fill_gradientn(colors=c("#C62828","#F4A300","#95D5B2","#2D6A4F"), name=vc, labels=scales::comma) +
+        # Color convention must match the subtitle ("Lower Pi = more
+        # stable & widely adapted"): green = low Pi = desirable,
+        # red = high Pi = undesirable. The previous color order
+        # (red→green from low→high) was inverted — it painted the
+        # BEST genotypes (lowest Pi) red and the WORST genotypes
+        # (highest Pi) dark green, which is exactly backwards and is
+        # why the plot looked "incorrect". This now mirrors the
+        # Shukla Variance plot's color logic above.
+        scale_fill_gradientn(colors=c("#2D6A4F","#95D5B2","#F4A300","#C62828"), name=vc, labels=scales::comma) +
         labs(title="Lin & Binns Superiority Index", subtitle="Lower Pi = more stable & widely adapted",
              x="Genotype", y=paste("Superiority Index (", vc, ")")) +
         theme_met() + theme(legend.position="none")
@@ -1369,7 +2039,7 @@ metServer <- function(id) {
     output$dl_plt_np <- downloadHandler(paste0("superiority_",Sys.Date(),".pdf"), function(f){ req(r_plt_np()); save_pdf(r_plt_np(),f,14,10) })
     output$dl_super  <- downloadHandler(paste0("superiority_",Sys.Date(),".xlsx"), function(f){ req(np_r()); v<-input$stab_np_var; write_xlsx(tryCatch(metan_df(np_r()$super,v),error=function(e)data.frame(Error=e$message)),f) })
     output$dl_fox    <- downloadHandler(paste0("fox_",Sys.Date(),".xlsx"), function(f){ req(np_r()); write_xlsx(tryCatch(metan_df(np_r()$fox,input$stab_np_var),error=function(e)data.frame(Error=e$message)),f) })
-
+    
     # Stability Factor Analysis
     fa_r <- eventReactive(input$btn_stab_fa, { req(processed_data(),input$stab_fa_var); vs<-sym(input$stab_fa_var); tryCatch(ge_factanal(processed_data(),ENV,GEN,REP,!!vs),error=function(e)NULL) })
     output$tbl_fa_scores <- renderDT({ req(fa_r()); v<-input$stab_fa_var; fmt_dt(tryCatch(safe_df(fa_r()[[v]]$scores.gen),error=function(e)data.frame(Error=e$message))) })
@@ -1378,11 +2048,11 @@ metServer <- function(id) {
     output$plt_fa        <- renderPlot({ req(fa_r()); tryCatch(plot(fa_r()),error=function(e) ggplot()+annotate("text",x=.5,y=.5,label=paste("Error:",e$message),size=4)+theme_void()) })
     output$dl_plt_fa     <- downloadHandler(paste0("factor_biplot_",Sys.Date(),".pdf"), function(f){ req(fa_r()); cairo_pdf(f,16,12); tryCatch(plot(fa_r()),error=function(e){plot.new();title(e$message)}); dev.off() })
     output$dl_fa         <- downloadHandler(paste0("factor_analysis_",Sys.Date(),".xlsx"), function(f){ req(fa_r()); v<-input$stab_fa_var; r<-fa_r(); write_xlsx(list(Scores=tryCatch(safe_df(r[[v]]$scores.gen),error=function(e)data.frame()),Loadings=tryCatch(safe_df(r[[v]]$finish.loadings),error=function(e)data.frame()),PCA=tryCatch(safe_df(r[[v]]$PCA),error=function(e)data.frame())),f) })
-
+    
     # Stability Wrap
     wrap_r <- eventReactive(input$btn_wrap, { req(processed_data(),input$wrap_var); vs<-sym(input$wrap_var)
-      m <- tryCatch(ge_stats(processed_data(),ENV,GEN,REP,!!vs),error=function(e)NULL); req(m)
-      list(params=tryCatch(get_model_data(m),error=function(e)NULL), ranks=tryCatch(get_model_data(m,"ranks"),error=function(e)NULL)) })
+    m <- tryCatch(ge_stats(processed_data(),ENV,GEN,REP,!!vs),error=function(e)NULL); req(m)
+    list(params=tryCatch(get_model_data(m),error=function(e)NULL), ranks=tryCatch(get_model_data(m,"ranks"),error=function(e)NULL)) })
     output$tbl_wrap      <- renderDT({ req(wrap_r(),wrap_r()$params); fmt_dt(as.data.frame(wrap_r()$params),20) })
     output$tbl_wrap_rank <- renderDT({ req(wrap_r(),wrap_r()$ranks);  fmt_dt(as.data.frame(wrap_r()$ranks),20) })
     output$plt_wrap_cor  <- renderPlot({ req(wrap_r(),wrap_r()$params)
@@ -1393,17 +2063,17 @@ metServer <- function(id) {
     output$dl_plt_cor    <- downloadHandler(paste0("stability_cor_",Sys.Date(),".pdf"), function(f){ req(wrap_r()); df<-as.data.frame(wrap_r()$params)%>%select(where(is.numeric))%>%select(any_of(c("Y","CV","Shukla","Wi_g","ASV","WAASB","HMGV","RPGV","HMRPGV","Pi_a","S1","S2","N1","N2"))); cm<-cor(df,use="complete.obs"); cairo_pdf(f,14,12); corrplot(cm,method="color",type="upper",order="hclust",addCoef.col="white",tl.cex=1,number.cex=.75,col=colorRampPalette(c("#C62828","white","#2D6A4F"))(200),tl.col="#0D3B2E",mar=c(0,0,3,0),title="Stability Parameter Correlations"); dev.off() })
     output$dl_wrap       <- downloadHandler(paste0("wrap_stability_",Sys.Date(),".xlsx"), function(f){ req(wrap_r()); write_xlsx(as.data.frame(wrap_r()$params),f) })
     output$dl_wrap_rank  <- downloadHandler(paste0("wrap_rankings_",Sys.Date(),".xlsx"),  function(f){ req(wrap_r()); write_xlsx(as.data.frame(wrap_r()$ranks),f) })
-
+    
     # AMMI
     ammi_r <- eventReactive(input$btn_ammi, { req(processed_data(),input$ammi_var); df<-processed_data(); vs<-sym(input$ammi_var)
-      amod <- tryCatch(performs_ammi(df,ENV,GEN,REP,!!vs),error=function(e)NULL); req(amod)
-      waas1 <- tryCatch(waas(df,ENV,GEN,REP,!!vs),error=function(e)NULL)
-      list(ammi=amod, waas=waas1) })
+    amod <- tryCatch(performs_ammi(df,ENV,GEN,REP,!!vs),error=function(e)NULL); req(amod)
+    waas1 <- tryCatch(waas(df,ENV,GEN,REP,!!vs),error=function(e)NULL)
+    list(ammi=amod, waas=waas1) })
     output$tbl_ammi_anova <- renderDT({ req(ammi_r()); v<-input$ammi_var; fmt_dt(tryCatch(safe_df(ammi_r()$ammi[[v]]$ANOVA),error=function(e)data.frame(Error=e$message))) })
     output$tbl_ipca       <- renderDT({ req(ammi_r()); fmt_dt(tryCatch(safe_df(get_model_data(ammi_r()$ammi,"ipca_pval")),error=function(e)data.frame(Error=e$message))) })
     bap <- function(type_n, mk="ammi") reactive({ req(ammi_r()); m<-ammi_r()[[mk]]; req(m)
-      tryCatch(plot_scores(m,type=type_n)+theme_met()+labs(caption="Dr. Vijay Kamal Meena | AU Jodhpur"),
-               error=function(e) ggplot()+annotate("text",x=.5,y=.5,label=paste("Plot unavailable:",e$message),size=4)+theme_void()) })
+    tryCatch(plot_scores(m,type=type_n)+theme_met()+labs(caption="Dr. Vijay Kamal Meena | AU Jodhpur"),
+             error=function(e) ggplot()+annotate("text",x=.5,y=.5,label=paste("Plot unavailable:",e$message),size=4)+theme_void()) })
     r_ammi1<-bap(1,"ammi"); r_ammi2<-bap(2,"ammi"); r_waas<-bap(3,"waas")
     output$plt_ammi1    <- renderPlot({ req(r_ammi1()); r_ammi1() })
     output$plt_ammi2    <- renderPlot({ req(r_ammi2()); r_ammi2() })
@@ -1412,20 +2082,20 @@ metServer <- function(id) {
     output$dl_plt_ammi2 <- downloadHandler(paste0("AMMI2_",Sys.Date(),".pdf"), function(f){ req(r_ammi2()); save_pdf(r_ammi2(),f,16,12) })
     output$dl_plt_waas  <- downloadHandler(paste0("WAAS_",Sys.Date(),".pdf"),  function(f){ req(r_waas()); save_pdf(r_waas(),f,16,12) })
     output$tbl_ammi_idx <- renderDT({ req(ammi_r()); sc<-tryCatch(plot_scores(ammi_r()$ammi),error=function(e)NULL); req(sc,!is.null(sc$data)); df<-sc$data
-      if(all(c("PC1","PC2","Y") %in% names(df))){ ss1<-tryCatch({pv<-get_model_data(ammi_r()$ammi,"ipca_pval");as.numeric(pv[1,"percent"])},error=function(e)60); ss2<-100-ss1; df<-df%>%mutate(ASV=sqrt((PC1^2*(ss1/ss2))+PC2^2),Rank_Y=rank(-Y),Rank_Stability=rank(ASV),Combined_Rank=Rank_Y+Rank_Stability)%>%arrange(Combined_Rank) }
-      fmt_dt(df,20) })
+    if(all(c("PC1","PC2","Y") %in% names(df))){ ss1<-tryCatch({pv<-get_model_data(ammi_r()$ammi,"ipca_pval");as.numeric(pv[1,"percent"])},error=function(e)60); ss2<-100-ss1; df<-df%>%mutate(ASV=sqrt((PC1^2*(ss1/ss2))+PC2^2),Rank_Y=rank(-Y),Rank_Stability=rank(ASV),Combined_Rank=Rank_Y+Rank_Stability)%>%arrange(Combined_Rank) }
+    fmt_dt(df,20) })
     output$dl_ammi_anova <- downloadHandler(paste0("ammi_anova_",Sys.Date(),".xlsx"), function(f){ req(ammi_r()); v<-input$ammi_var; write_xlsx(tryCatch(safe_df(ammi_r()$ammi[[v]]$ANOVA),error=function(e)data.frame()),f) })
     output$dl_ammi_idx   <- downloadHandler(paste0("ammi_index_",Sys.Date(),".xlsx"), function(f){ req(ammi_r()); sc<-tryCatch(plot_scores(ammi_r()$ammi),error=function(e)NULL); req(sc); write_xlsx(as.data.frame(sc$data),f) })
-
+    
     # GGE
     gge_r <- eventReactive(input$btn_gge, { req(processed_data(),input$gge_var,input$gge_svp); df<-processed_data(); vs<-sym(input$gge_var); svp<-input$gge_svp
-      list(env=tryCatch(gge(df,ENV,GEN,!!vs,svp="environment"),error=function(e)NULL),
-           gen=tryCatch(gge(df,ENV,GEN,!!vs,svp="genotype"),error=function(e)NULL),
-           sym=tryCatch(gge(df,ENV,GEN,!!vs,svp="symmetrical"),error=function(e)NULL),
-           sel=tryCatch(gge(df,ENV,GEN,!!vs,svp=svp),error=function(e)NULL)) })
+    list(env=tryCatch(gge(df,ENV,GEN,!!vs,svp="environment"),error=function(e)NULL),
+         gen=tryCatch(gge(df,ENV,GEN,!!vs,svp="genotype"),error=function(e)NULL),
+         sym=tryCatch(gge(df,ENV,GEN,!!vs,svp="symmetrical"),error=function(e)NULL),
+         sel=tryCatch(gge(df,ENV,GEN,!!vs,svp=svp),error=function(e)NULL)) })
     bgp <- function(type_n, mk="sym") reactive({ req(gge_r()); m<-gge_r()[[mk]] %||% gge_r()$sel; req(m)
-      tryCatch(plot(m,type=type_n)+theme_met()+labs(caption="Dr. Vijay Kamal Meena | AU Jodhpur"),
-               error=function(e) ggplot()+annotate("text",x=.5,y=.5,label=paste("Try different SVP. Error:",e$message),size=3.5)+theme_void()) })
+    tryCatch(plot(m,type=type_n)+theme_met()+labs(caption="Dr. Vijay Kamal Meena | AU Jodhpur"),
+             error=function(e) ggplot()+annotate("text",x=.5,y=.5,label=paste("Try different SVP. Error:",e$message),size=3.5)+theme_void()) })
     r_gge1<-bgp(1,"sym"); r_gge2<-bgp(2,"gen"); r_gge3<-bgp(3,"sym"); r_gge4<-bgp(4,"env"); r_gge5<-bgp(8,"gen"); r_gge6<-bgp(6,"env"); r_gge7<-bgp(10,"env")
     output$plt_gge1<-renderPlot({req(r_gge1());r_gge1()}); output$plt_gge2<-renderPlot({req(r_gge2());r_gge2()}); output$plt_gge3<-renderPlot({req(r_gge3());r_gge3()})
     output$plt_gge4<-renderPlot({req(r_gge4());r_gge4()}); output$plt_gge5<-renderPlot({req(r_gge5());r_gge5()}); output$plt_gge6<-renderPlot({req(r_gge6());r_gge6()}); output$plt_gge7<-renderPlot({req(r_gge7());r_gge7()})
@@ -1433,6 +2103,94 @@ metServer <- function(id) {
     output$dl_plt_gge1<-dlgp(r_gge1,"GGE_basic"); output$dl_plt_gge2<-dlgp(r_gge2,"GGE_mean_stability"); output$dl_plt_gge3<-dlgp(r_gge3,"GGE_WWW")
     output$dl_plt_gge4<-dlgp(r_gge4,"GGE_discrim"); output$dl_plt_gge5<-dlgp(r_gge5,"GGE_rank_gen"); output$dl_plt_gge6<-dlgp(r_gge6,"GGE_rank_env"); output$dl_plt_gge7<-dlgp(r_gge7,"GGE_relation")
     output$dl_gge <- downloadHandler(paste0("gge_predictions_",Sys.Date(),".xlsx"), function(f){ req(gge_r()); v<-input$gge_var; m<-gge_r()$sym%||%gge_r()$env%||%gge_r()$gen; req(m); pred<-tryCatch(predict(m),error=function(e)NULL); req(pred); write_xlsx(tryCatch(safe_df(pred[[v]]),error=function(e)data.frame(Error=e$message)),f) })
+    
+    # ════════════════════════════════════════════════════════════
+    #  DYNAMIC EXPORT — Module 2 (MET): only bundles analyses that
+    #  have actually been run (eventReactive()s throw silently until
+    #  their button has been pressed at least once; safe_get() turns
+    #  that into a plain NULL so status/zip logic can branch on it).
+    # ════════════════════════════════════════════════════════════
+    safe_get <- function(r) tryCatch(r(), error=function(e) NULL)
+    
+    output$export_status_ui <- renderUI({
+      items <- list(
+        c("Descriptive Statistics", !is.null(safe_get(desc_r))),
+        c("Mean Performance",       !is.null(safe_get(mean_r))),
+        c("ANOVA",                  !is.null(safe_get(anova_r))),
+        c("Stability (ANOVA-based)",!is.null(safe_get(sa_r))),
+        c("Stability Regression",   !is.null(safe_get(sr_r))),
+        c("Stability Non-parametric", !is.null(safe_get(np_r))),
+        c("Stability Factor Analysis", !is.null(safe_get(fa_r))),
+        c("Stability Wrap-up",      !is.null(safe_get(wrap_r))),
+        c("AMMI",                   !is.null(safe_get(ammi_r))),
+        c("GGE",                    !is.null(safe_get(gge_r)))
+      )
+      div(style="display:flex;flex-wrap:wrap;gap:10px;",
+          lapply(items, function(it) {
+            done <- isTRUE(as.logical(it[2]))
+            span(style=paste0("padding:6px 12px;border-radius:14px;font-size:12px;font-weight:600;",
+                              if (done) "background:#e3f5e9;color:#155d34;" else "background:#f1f1f1;color:#888;"),
+                 paste0(if (done) "\u2705 " else "\u23F3 ", it[1]))
+          })
+      )
+    })
+    
+    output$dl_all_zip <- downloadHandler(
+      filename = function() paste0("MET_Module2_Results_", Sys.Date(), ".zip"),
+      content = function(file) {
+        items <- list()
+        if (!is.null(safe_get(desc_r))) items$desc <- list(filename="Descriptive_Statistics.xlsx", write=function(p) write_xlsx(as.data.frame(desc_r()), p))
+        if (!is.null(safe_get(mean_r))) items$mean <- list(filename="Mean_Performance.xlsx", write=function(p) write_xlsx(as.data.frame(mean_r()), p))
+        if (!is.null(safe_get(anova_r))) {
+          v <- input$anova_var
+          items$anova_ind  <- list(filename="ANOVA_Individual.xlsx", write=function(p) write_xlsx(tryCatch(safe_df(anova_r()$ind[[v]]$individual),error=function(e)data.frame()), p))
+          items$anova_pool <- list(filename="ANOVA_Pooled.xlsx",     write=function(p) write_xlsx(tryCatch(safe_df(anova_r()$pool[[v]]$anova),error=function(e)data.frame()), p))
+        }
+        if (!is.null(safe_get(sa_r))) {
+          v <- input$stab_anova_var
+          items$eco    <- list(filename="Ecovalence.xlsx", write=function(p) write_xlsx(tryCatch(metan_df(sa_r()$eco,v),error=function(e)data.frame(Error=e$message)), p))
+          items$shukla <- list(filename="Shukla.xlsx",     write=function(p) write_xlsx(tryCatch(metan_df(sa_r()$shukla,v),error=function(e)data.frame(Error=e$message)), p))
+          pl <- safe_get(r_plt_shukla); if (!is.null(pl)) items$shukla_pdf <- list(filename="Shukla_Plot.pdf", write=function(p) save_pdf(pl, p, 14, 10))
+        }
+        if (!is.null(safe_get(sr_r))) {
+          v <- input$stab_reg_var
+          items$reg_anova <- list(filename="Regression_ANOVA.xlsx", write=function(p) write_xlsx(tryCatch(safe_df(sr_r()[[v]]$anova),error=function(e)data.frame()), p))
+          items$reg_pdf   <- list(filename="Regression_Plot.pdf",   write=function(p){ cairo_pdf(p,16,10); tryCatch(plot(sr_r()),error=function(e){plot.new();title(e$message)}); dev.off() })
+        }
+        if (!is.null(safe_get(np_r))) {
+          v <- input$stab_np_var
+          items$super <- list(filename="Superiority.xlsx", write=function(p) write_xlsx(tryCatch(metan_df(np_r()$super,v),error=function(e)data.frame(Error=e$message)), p))
+          items$fox   <- list(filename="Fox.xlsx",         write=function(p) write_xlsx(tryCatch(metan_df(np_r()$fox,v),error=function(e)data.frame(Error=e$message)), p))
+          pl <- safe_get(r_plt_np); if (!is.null(pl)) items$super_pdf <- list(filename="Superiority_Plot.pdf", write=function(p) save_pdf(pl, p, 14, 10))
+        }
+        if (!is.null(safe_get(fa_r))) {
+          v <- input$stab_fa_var; r <- fa_r()
+          items$fa <- list(filename="Factor_Analysis.xlsx", write=function(p) write_xlsx(list(
+            Scores=tryCatch(safe_df(r[[v]]$scores.gen),error=function(e)data.frame()),
+            Loadings=tryCatch(safe_df(r[[v]]$finish.loadings),error=function(e)data.frame()),
+            PCA=tryCatch(safe_df(r[[v]]$PCA),error=function(e)data.frame())), p))
+          items$fa_pdf <- list(filename="Factor_Biplot.pdf", write=function(p){ cairo_pdf(p,16,12); tryCatch(plot(fa_r()),error=function(e){plot.new();title(e$message)}); dev.off() })
+        }
+        if (!is.null(safe_get(wrap_r))) {
+          items$wrap      <- list(filename="Wrap_Stability.xlsx",  write=function(p) write_xlsx(as.data.frame(wrap_r()$params), p))
+          items$wrap_rank <- list(filename="Wrap_Rankings.xlsx",   write=function(p) write_xlsx(as.data.frame(wrap_r()$ranks), p))
+        }
+        if (!is.null(safe_get(ammi_r))) {
+          v <- input$ammi_var
+          items$ammi_anova <- list(filename="AMMI_ANOVA.xlsx", write=function(p) write_xlsx(tryCatch(safe_df(ammi_r()$ammi[[v]]$ANOVA),error=function(e)data.frame()), p))
+          a1 <- safe_get(r_ammi1); if (!is.null(a1)) items$ammi1_pdf <- list(filename="AMMI1.pdf", write=function(p) save_pdf(a1, p, 16, 12))
+          a2 <- safe_get(r_ammi2); if (!is.null(a2)) items$ammi2_pdf <- list(filename="AMMI2.pdf", write=function(p) save_pdf(a2, p, 16, 12))
+        }
+        if (!is.null(safe_get(gge_r))) {
+          v <- input$gge_var; m <- gge_r()$sym %||% gge_r()$env %||% gge_r()$gen
+          pred <- tryCatch(predict(m), error=function(e) NULL)
+          if (!is.null(pred)) items$gge_pred <- list(filename="GGE_Predictions.xlsx", write=function(p) write_xlsx(tryCatch(safe_df(pred[[v]]),error=function(e)data.frame(Error=e$message)), p))
+          g1 <- safe_get(r_gge1); if (!is.null(g1)) items$gge1_pdf <- list(filename="GGE_Basic_Biplot.pdf", write=function(p) save_pdf(g1, p, 14, 11))
+        }
+        build_zip_export(items, file)
+      },
+      contentType = "application/zip"
+    )
   })
 }
 
@@ -1518,7 +2276,7 @@ make_circular_index_plot <- function(index_tbl, genotype_col, value_col, selecte
            angle     = ifelse(angle_raw < -90, angle_raw+180, angle_raw),
            hjust     = ifelse(angle_raw < -90, 1, 0),
            label_y   = if(lower_is_better) min(IndexValue,na.rm=TRUE)-vr*stagger
-                       else                max(IndexValue,na.rm=TRUE)+vr*stagger)
+           else                max(IndexValue,na.rm=TRUE)+vr*stagger)
   p <- ggplot(plot_tbl,aes(x=Rank,y=IndexValue,group=1)) +
     geom_path(color="grey35",linewidth=.45) +
     geom_point(aes(fill=Selected),shape=21,size=2.5,color="black",stroke=.25) +
@@ -1555,12 +2313,12 @@ make_four_set_venn <- function(selected_list, title_text="Venn Diagram of Select
   req(length(selected_list)==4); snv <- names(selected_list)
   region_counts <- make_venn_genotype_table(selected_list)
   rp <- tribble(~Region,~x,~y, snv[1],-2.65,2.15, snv[2],2.65,2.15, snv[3],-2.65,-2.15, snv[4],2.65,-2.15,
-    paste(snv[c(1,2)],collapse="&"),0.00,2.65, paste(snv[c(1,3)],collapse="&"),-2.65,0.00,
-    paste(snv[c(2,4)],collapse="&"),2.65,0.00, paste(snv[c(3,4)],collapse="&"),0.00,-2.65,
-    paste(snv[c(1,4)],collapse="&"),-0.95,0.95, paste(snv[c(2,3)],collapse="&"),0.95,0.95,
-    paste(snv[c(1,2,3)],collapse="&"),-0.75,1.55, paste(snv[c(1,2,4)],collapse="&"),0.75,1.55,
-    paste(snv[c(1,3,4)],collapse="&"),-0.75,-0.35, paste(snv[c(2,3,4)],collapse="&"),0.75,-0.35,
-    paste(snv,collapse="&"),0.00,0.35)
+                paste(snv[c(1,2)],collapse="&"),0.00,2.65, paste(snv[c(1,3)],collapse="&"),-2.65,0.00,
+                paste(snv[c(2,4)],collapse="&"),2.65,0.00, paste(snv[c(3,4)],collapse="&"),0.00,-2.65,
+                paste(snv[c(1,4)],collapse="&"),-0.95,0.95, paste(snv[c(2,3)],collapse="&"),0.95,0.95,
+                paste(snv[c(1,2,3)],collapse="&"),-0.75,1.55, paste(snv[c(1,2,4)],collapse="&"),0.75,1.55,
+                paste(snv[c(1,3,4)],collapse="&"),-0.75,-0.35, paste(snv[c(2,3,4)],collapse="&"),0.75,-0.35,
+                paste(snv,collapse="&"),0.00,0.35)
   lt <- rp %>% left_join(region_counts,by="Region") %>% mutate(Count=replace_na(Count,0L),Genotypes=replace_na(Genotypes,""))
   ct <- tibble(x0=c(-1,1,-1,1),y0=c(1,1,-1,-1),r=2,fill=c("#E41A1C","#377EB8","#4DAF4A","#984EA3"),label=snv,lx=c(-2.95,2.95,-2.95,2.95),ly=c(3.2,3.2,-3.2,-3.2))
   ggplot()+geom_circle(data=ct,aes(x0=x0,y0=y0,r=r,fill=fill),color=NA,alpha=.25,inherit.aes=FALSE,show.legend=FALSE)+scale_fill_identity()+geom_text(data=ct,aes(lx,ly,label=label),fontface="bold",size=5)+geom_text(data=lt%>%filter(Genotypes!=""),aes(x,y,label=Genotypes),size=2.7,fontface="bold",lineheight=.92)+coord_fixed(xlim=c(-5,5),ylim=c(-4.5,4.5),clip="off")+labs(title=title_text)+theme_void(base_size=12)+theme(plot.title=element_text(face="bold",size=16,hjust=.5))
@@ -1573,250 +2331,257 @@ mtUI <- function(id) {
   ns <- NS(id)
   tagList(
     tabItem("mt_home",
-      div(class="home-banner",h2("🌿 Multi-Trait Selection Analysis Suite"),p("MTSI · MGIDI · FAI-BLUP · Smith-Hazel · Direct Selection | GT & GYT Biplots | Venn & Radar"),div(class="vtag","VERSION 1.0 | 2025")),
-      fluidRow(
-        column(3,div(class="feat-card",div(class="fi","🎯"),h4("MTSI"),p("Multi-Trait Stability Index from waasb model."))),
-        column(3,div(class="feat-card",div(class="fi","🧬"),h4("MGIDI"),p("Multi-trait Genotype-Ideotype Distance Index."))),
-        column(3,div(class="feat-card",div(class="fi","🔢"),h4("FAI-BLUP"),p("Factor Analysis and Ideotype-Design BLUPs."))),
-        column(3,div(class="feat-card",div(class="fi","⚖️"),h4("Smith-Hazel"),p("Classical selection index with covariance matrices.")))
-      )
+            div(class="home-banner",h2("🌿 Multi-Trait Selection Analysis Suite"),p("MTSI · MGIDI · FAI-BLUP · Smith-Hazel · Direct Selection | GT & GYT Biplots | Venn & Radar"),div(class="vtag","VERSION 1.0 | 2025")),
+            fluidRow(
+              column(3,div(class="feat-card",div(class="fi","🎯"),h4("MTSI"),p("Multi-Trait Stability Index from waasb model."))),
+              column(3,div(class="feat-card",div(class="fi","🧬"),h4("MGIDI"),p("Multi-trait Genotype-Ideotype Distance Index."))),
+              column(3,div(class="feat-card",div(class="fi","🔢"),h4("FAI-BLUP"),p("Factor Analysis and Ideotype-Design BLUPs."))),
+              column(3,div(class="feat-card",div(class="fi","⚖️"),h4("Smith-Hazel"),p("Classical selection index with covariance matrices.")))
+            )
     ),
     tabItem("mt_data",
-      div(class="sec-bar","📂 MT — Data & Settings"),
-      fluidRow(
-        box(title="Upload CSV & Column Mapping",width=4,status="success",solidHeader=TRUE,
-          fileInput(ns("file1"),"Choose CSV File",accept=".csv"),
-          hr(), h5(style="color:#1B4332;font-weight:700;","Column Names"),
-          uiOutput(ns("ui_env_col")), uiOutput(ns("ui_gen_col")), uiOutput(ns("ui_rep_col")),
-          hr(), h5(style="color:#1B4332;font-weight:700;","Analysis Settings"),
-          uiOutput(ns("ui_yield_trait")),
-          numericInput(ns("sel_intensity"),"Selection Intensity (%):",15,min=1,max=50), hr(),
-          actionButton(ns("btn_load"),"⚙️  Process Data",class="btn-success btn-block",icon=icon("play"))
-        ),
-        box(title="Trait Goals Configuration",width=5,status="success",solidHeader=TRUE,
-          uiOutput(ns("val_alert_mt")),
-          p(style="color:#555;font-size:12px;","Select whether higher or lower values are desired for each trait."),
-          uiOutput(ns("ui_trait_goals")), br(), uiOutput(ns("value_boxes"))
-        ),
-        box(title="Data Preview",width=3,status="success",solidHeader=TRUE, DTOutput(ns("tbl_preview_mini")))
-      )
+            div(class="sec-bar","📂 MT — Data & Settings"),
+            fluidRow(
+              box(title="Upload CSV & Column Mapping",width=4,status="success",solidHeader=TRUE,
+                  fileInput(ns("file1"),"Choose CSV File",accept=".csv"),
+                  hr(), h5(style="color:#1B4332;font-weight:700;","Column Names"),
+                  uiOutput(ns("ui_env_col")), uiOutput(ns("ui_gen_col")), uiOutput(ns("ui_rep_col")),
+                  hr(), h5(style="color:#1B4332;font-weight:700;","Analysis Settings"),
+                  uiOutput(ns("ui_yield_trait")),
+                  numericInput(ns("sel_intensity"),"Selection Intensity (%):",15,min=1,max=50), hr(),
+                  actionButton(ns("btn_load"),"⚙️  Process Data",class="btn-success btn-block",icon=icon("play"))
+              ),
+              box(title="Trait Goals Configuration",width=5,status="success",solidHeader=TRUE,
+                  uiOutput(ns("val_alert_mt")),
+                  p(style="color:#555;font-size:12px;","Select whether higher or lower values are desired for each trait."),
+                  uiOutput(ns("ui_trait_goals")), br(), uiOutput(ns("value_boxes"))
+              ),
+              box(title="Data Preview",width=3,status="success",solidHeader=TRUE, DTOutput(ns("tbl_preview_mini")))
+            )
     ),
     tabItem("mt_fit",
-      div(class="sec-bar","⚙️ MT — Fit Mixed Models (gamem_met + waasb)"),
-      fluidRow(
-        box(title="Run Models",width=4,status="success",solidHeader=TRUE,
-          div(style="background:#F7FBF8;border:1px solid #D8EDE1;border-radius:8px;padding:11px;margin-bottom:11px;",
-              h5(style="color:#1B4332;margin:0 0 7px;","Selected Traits:"), uiOutput(ns("ui_selected_traits_display")),
-              h5(style="color:#1B4332;margin:7px 0;","Trait Goals:"), uiOutput(ns("ui_goals_display"))),
-          actionButton(ns("btn_fit"),"▶  Fit gamem_met + waasb",class="btn-success btn-block",icon=icon("play")),
-          p(style="color:#888;font-size:11px;margin-top:7px;","⚠️ Model fitting may take several minutes."),
-          hr(), uiOutput(ns("fit_status"))
-        ),
-        box(title="Model Output",width=8,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("gamem_met Summary", br(), verbatimTextOutput(ns("txt_gamem"))),
-            tabPanel("waasb Summary",     br(), verbatimTextOutput(ns("txt_waasb"))),
-            tabPanel("BLUP Matrix",       br(), DTOutput(ns("tbl_blup")))
-          )
-        )
-      )
+            div(class="sec-bar","⚙️ MT — Fit Mixed Models (gamem_met + waasb)"),
+            fluidRow(
+              box(title="Run Models",width=4,status="success",solidHeader=TRUE,
+                  div(style="background:#F7FBF8;border:1px solid #D8EDE1;border-radius:8px;padding:11px;margin-bottom:11px;",
+                      h5(style="color:#1B4332;margin:0 0 7px;","Selected Traits:"), uiOutput(ns("ui_selected_traits_display")),
+                      h5(style="color:#1B4332;margin:7px 0;","Trait Goals:"), uiOutput(ns("ui_goals_display"))),
+                  actionButton(ns("btn_fit"),"▶  Fit gamem_met + waasb",class="btn-success btn-block",icon=icon("play")),
+                  p(style="color:#888;font-size:11px;margin-top:7px;","⚠️ Model fitting may take several minutes."),
+                  hr(), uiOutput(ns("fit_status"))
+              ),
+              box(title="Model Output",width=8,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("gamem_met Summary", br(), verbatimTextOutput(ns("txt_gamem"))),
+                    tabPanel("waasb Summary",     br(), verbatimTextOutput(ns("txt_waasb"))),
+                    tabPanel("BLUP Matrix",       br(), DTOutput(ns("tbl_blup")))
+                  )
+              )
+            )
     ),
     tabItem("mt_varcomp",
-      div(class="sec-bar","📊 MT — Variance Components (Table 2)"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          actionButton(ns("btn_table2"),"▶  Build Table 2",class="btn-success btn-block",icon=icon("table")), hr(),
-          downloadButton(ns("dl_table2"),"⬇  Download Excel",class="btn-warning btn-block")
-        ),
-        box(title="Table 2 — Variance Components",width=9,status="success",solidHeader=TRUE, DTOutput(ns("tbl_varcomp")))
-      )
+            div(class="sec-bar","📊 MT — Variance Components (Table 2)"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  actionButton(ns("btn_table2"),"▶  Build Table 2",class="btn-success btn-block",icon=icon("table")), hr(),
+                  downloadButton(ns("dl_table2"),"⬇  Download Excel",class="btn-warning btn-block")
+              ),
+              box(title="Table 2 — Variance Components",width=9,status="success",solidHeader=TRUE, DTOutput(ns("tbl_varcomp")))
+            )
     ),
     tabItem("mt_mtsi",
-      div(class="sec-bar","🎯 MT — MTSI"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          actionButton(ns("btn_mtsi"),"▶  Run MTSI",class="btn-success btn-block",icon=icon("play")), hr(),
-          downloadButton(ns("dl_mtsi_idx"),    "⬇  MTSI Index",         class="btn-warning btn-block"), br(),
-          downloadButton(ns("dl_mtsi_contrib"),"⬇  Factor Contribution", class="btn-warning btn-block")
-        ),
-        box(title="MTSI Results",width=9,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 MTSI Index",    br(), DTOutput(ns("tbl_mtsi"))),
-            tabPanel("📋 Selected",      br(), verbatimTextOutput(ns("txt_mtsi_sel"))),
-            tabPanel("📊 Circular Plot",        dl_bar(ns("dl_plt_mtsi_circ")),   plotOutput(ns("plt_mtsi_circ"),height="500px")),
-            tabPanel("📊 Strengths & Weaknesses", dl_bar(ns("dl_plt_mtsi_sw")),    plotOutput(ns("plt_mtsi_sw"),height="520px")),
-            tabPanel("📊 Contribution",           dl_bar(ns("dl_plt_mtsi_contrib")), plotOutput(ns("plt_mtsi_contrib"),height="400px")),
-            tabPanel("📊 metan Default",          dl_bar(ns("dl_plt_mtsi_def")),    plotOutput(ns("plt_mtsi_def"),height="400px"))
-          )
-        )
-      )
+            div(class="sec-bar","🎯 MT — MTSI"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  actionButton(ns("btn_mtsi"),"▶  Run MTSI",class="btn-success btn-block",icon=icon("play")), hr(),
+                  downloadButton(ns("dl_mtsi_idx"),    "⬇  MTSI Index",         class="btn-warning btn-block"), br(),
+                  downloadButton(ns("dl_mtsi_contrib"),"⬇  Factor Contribution", class="btn-warning btn-block")
+              ),
+              box(title="MTSI Results",width=9,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 MTSI Index",    br(), DTOutput(ns("tbl_mtsi"))),
+                    tabPanel("📋 Selected",      br(), verbatimTextOutput(ns("txt_mtsi_sel"))),
+                    tabPanel("📊 Circular Plot",        dl_bar(ns("dl_plt_mtsi_circ")),   plotOutput(ns("plt_mtsi_circ"),height="500px")),
+                    tabPanel("📊 Strengths & Weaknesses", dl_bar(ns("dl_plt_mtsi_sw")),    plotOutput(ns("plt_mtsi_sw"),height="520px")),
+                    tabPanel("📊 Contribution",           dl_bar(ns("dl_plt_mtsi_contrib")), plotOutput(ns("plt_mtsi_contrib"),height="400px")),
+                    tabPanel("📊 metan Default",          dl_bar(ns("dl_plt_mtsi_def")),    plotOutput(ns("plt_mtsi_def"),height="400px"))
+                  )
+              )
+            )
     ),
     tabItem("mt_mgidi",
-      div(class="sec-bar","🧬 MT — MGIDI"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          actionButton(ns("btn_mgidi"),"▶  Run MGIDI",class="btn-success btn-block",icon=icon("play")), hr(),
-          downloadButton(ns("dl_mgidi_idx"),    "⬇  MGIDI Index",        class="btn-warning btn-block"), br(),
-          downloadButton(ns("dl_mgidi_contrib"),"⬇  Factor Contribution", class="btn-warning btn-block")
-        ),
-        box(title="MGIDI Results",width=9,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 MGIDI Index",   br(), DTOutput(ns("tbl_mgidi"))),
-            tabPanel("📋 Selected",      br(), verbatimTextOutput(ns("txt_mgidi_sel"))),
-            tabPanel("📊 Circular Plot",        dl_bar(ns("dl_plt_mgidi_circ")),   plotOutput(ns("plt_mgidi_circ"),height="500px")),
-            tabPanel("📊 Strengths & Weaknesses", dl_bar(ns("dl_plt_mgidi_sw")),    plotOutput(ns("plt_mgidi_sw"),height="520px")),
-            tabPanel("📊 Contribution",           dl_bar(ns("dl_plt_mgidi_contrib")), plotOutput(ns("plt_mgidi_contrib"),height="400px")),
-            tabPanel("📊 metan Default",          dl_bar(ns("dl_plt_mgidi_def")),    plotOutput(ns("plt_mgidi_def"),height="400px"))
-          )
-        )
-      )
+            div(class="sec-bar","🧬 MT — MGIDI"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  actionButton(ns("btn_mgidi"),"▶  Run MGIDI",class="btn-success btn-block",icon=icon("play")), hr(),
+                  downloadButton(ns("dl_mgidi_idx"),    "⬇  MGIDI Index",        class="btn-warning btn-block"), br(),
+                  downloadButton(ns("dl_mgidi_contrib"),"⬇  Factor Contribution", class="btn-warning btn-block")
+              ),
+              box(title="MGIDI Results",width=9,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 MGIDI Index",   br(), DTOutput(ns("tbl_mgidi"))),
+                    tabPanel("📋 Selected",      br(), verbatimTextOutput(ns("txt_mgidi_sel"))),
+                    tabPanel("📊 Circular Plot",        dl_bar(ns("dl_plt_mgidi_circ")),   plotOutput(ns("plt_mgidi_circ"),height="500px")),
+                    tabPanel("📊 Strengths & Weaknesses", dl_bar(ns("dl_plt_mgidi_sw")),    plotOutput(ns("plt_mgidi_sw"),height="520px")),
+                    tabPanel("📊 Contribution",           dl_bar(ns("dl_plt_mgidi_contrib")), plotOutput(ns("plt_mgidi_contrib"),height="400px")),
+                    tabPanel("📊 metan Default",          dl_bar(ns("dl_plt_mgidi_def")),    plotOutput(ns("plt_mgidi_def"),height="400px"))
+                  )
+              )
+            )
     ),
     tabItem("mt_fai",
-      div(class="sec-bar","🔢 MT — FAI-BLUP"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          actionButton(ns("btn_fai"),"▶  Run FAI-BLUP",class="btn-success btn-block",icon=icon("play")), hr(),
-          downloadButton(ns("dl_fai_idx"),"⬇  FAI Index",class="btn-warning btn-block")
-        ),
-        box(title="FAI-BLUP Results",width=9,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 FAI Index",  br(), DTOutput(ns("tbl_fai"))),
-            tabPanel("📋 Selected",   br(), verbatimTextOutput(ns("txt_fai_sel"))),
-            tabPanel("📊 Circular",   dl_bar(ns("dl_plt_fai_circ")), plotOutput(ns("plt_fai_circ"),height="500px")),
-            tabPanel("📊 metan Default", dl_bar(ns("dl_plt_fai_def")), plotOutput(ns("plt_fai_def"),height="400px"))
-          )
-        )
-      )
+            div(class="sec-bar","🔢 MT — FAI-BLUP"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  actionButton(ns("btn_fai"),"▶  Run FAI-BLUP",class="btn-success btn-block",icon=icon("play")), hr(),
+                  downloadButton(ns("dl_fai_idx"),"⬇  FAI Index",class="btn-warning btn-block")
+              ),
+              box(title="FAI-BLUP Results",width=9,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 FAI Index",  br(), DTOutput(ns("tbl_fai"))),
+                    tabPanel("📋 Selected",   br(), verbatimTextOutput(ns("txt_fai_sel"))),
+                    tabPanel("📊 Circular",   dl_bar(ns("dl_plt_fai_circ")), plotOutput(ns("plt_fai_circ"),height="500px")),
+                    tabPanel("📊 metan Default", dl_bar(ns("dl_plt_fai_def")), plotOutput(ns("plt_fai_def"),height="400px"))
+                  )
+              )
+            )
     ),
     tabItem("mt_sh",
-      div(class="sec-bar","⚖️ MT — Smith-Hazel"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          actionButton(ns("btn_sh"),"▶  Run Smith-Hazel",class="btn-success btn-block",icon=icon("play")), hr(),
-          downloadButton(ns("dl_sh_idx"),"⬇  SH Index",class="btn-warning btn-block")
-        ),
-        box(title="Smith-Hazel Results",width=9,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 Index",      br(), DTOutput(ns("tbl_sh"))),
-            tabPanel("📋 Selected",   br(), verbatimTextOutput(ns("txt_sh_sel"))),
-            tabPanel("📊 Circular",   dl_bar(ns("dl_plt_sh_circ")), plotOutput(ns("plt_sh_circ"),height="500px")),
-            tabPanel("📊 metan Default", dl_bar(ns("dl_plt_sh_def")), plotOutput(ns("plt_sh_def"),height="400px"))
-          )
-        )
-      )
+            div(class="sec-bar","⚖️ MT — Smith-Hazel"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  actionButton(ns("btn_sh"),"▶  Run Smith-Hazel",class="btn-success btn-block",icon=icon("play")), hr(),
+                  downloadButton(ns("dl_sh_idx"),"⬇  SH Index",class="btn-warning btn-block")
+              ),
+              box(title="Smith-Hazel Results",width=9,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 Index",      br(), DTOutput(ns("tbl_sh"))),
+                    tabPanel("📋 Selected",   br(), verbatimTextOutput(ns("txt_sh_sel"))),
+                    tabPanel("📊 Circular",   dl_bar(ns("dl_plt_sh_circ")), plotOutput(ns("plt_sh_circ"),height="500px")),
+                    tabPanel("📊 metan Default", dl_bar(ns("dl_plt_sh_def")), plotOutput(ns("plt_sh_def"),height="400px"))
+                  )
+              )
+            )
     ),
     tabItem("mt_direct",
-      div(class="sec-bar","📈 MT — Direct Selection"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          actionButton(ns("btn_direct"),"▶  Run Direct Selection",class="btn-success btn-block",icon=icon("play")), hr(),
-          downloadButton(ns("dl_direct"),"⬇  Download Excel",class="btn-warning btn-block")
-        ),
-        box(title="Direct Selection Results",width=9,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 Selected Genotypes", br(), DTOutput(ns("tbl_direct"))),
-            tabPanel("📊 Performance Plot",   dl_bar(ns("dl_plt_direct")), plotOutput(ns("plt_direct"),height="420px"))
-          )
-        )
-      )
+            div(class="sec-bar","📈 MT — Direct Selection"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  actionButton(ns("btn_direct"),"▶  Run Direct Selection",class="btn-success btn-block",icon=icon("play")), hr(),
+                  downloadButton(ns("dl_direct"),"⬇  Download Excel",class="btn-warning btn-block")
+              ),
+              box(title="Direct Selection Results",width=9,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 Selected Genotypes", br(), DTOutput(ns("tbl_direct"))),
+                    tabPanel("📊 Performance Plot",   dl_bar(ns("dl_plt_direct")), plotOutput(ns("plt_direct"),height="420px"))
+                  )
+              )
+            )
     ),
     tabItem("mt_table3",
-      div(class="sec-bar","📋 MT — Selection Differentials (Table 3)"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          actionButton(ns("btn_table3"),"▶  Build Table 3",class="btn-success btn-block",icon=icon("table")), hr(),
-          downloadButton(ns("dl_table3"),"⬇  Download Excel",class="btn-warning btn-block")
-        ),
-        box(title="Selection Differentials",width=9,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 All Methods", br(), DTOutput(ns("tbl_table3"))),
-            tabPanel("📊 SD Heatmap", dl_bar(ns("dl_plt_sd_heat")), plotOutput(ns("plt_sd_heat"),height="420px"))
-          )
-        )
-      )
+            div(class="sec-bar","📋 MT — Selection Differentials (Table 3)"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  actionButton(ns("btn_table3"),"▶  Build Table 3",class="btn-success btn-block",icon=icon("table")), hr(),
+                  downloadButton(ns("dl_table3"),"⬇  Download Excel",class="btn-warning btn-block")
+              ),
+              box(title="Selection Differentials",width=9,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 All Methods", br(), DTOutput(ns("tbl_table3"))),
+                    tabPanel("📊 SD Heatmap", dl_bar(ns("dl_plt_sd_heat")), plotOutput(ns("plt_sd_heat"),height="420px"))
+                  )
+              )
+            )
     ),
     tabItem("mt_coincidence",
-      div(class="sec-bar","🔗 MT — Coincidence Index & Membership"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          actionButton(ns("btn_coincidence"),"▶  Compute",class="btn-success btn-block",icon=icon("play")), hr(),
-          downloadButton(ns("dl_coincidence"),"⬇  Coincidence Excel",class="btn-warning btn-block"), br(),
-          downloadButton(ns("dl_membership"), "⬇  Membership Excel", class="btn-warning btn-block")
-        ),
-        box(title="Overlap Analysis",width=9,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📋 Coincidence Index",    br(), DTOutput(ns("tbl_coincidence"))),
-            tabPanel("📊 Coincidence Heatmap",  dl_bar(ns("dl_plt_ci_heat")), plotOutput(ns("plt_ci_heat"),height="420px")),
-            tabPanel("📋 Membership Table",     br(), DTOutput(ns("tbl_membership")))
-          )
-        )
-      )
+            div(class="sec-bar","🔗 MT — Coincidence Index & Membership"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  actionButton(ns("btn_coincidence"),"▶  Compute",class="btn-success btn-block",icon=icon("play")), hr(),
+                  downloadButton(ns("dl_coincidence"),"⬇  Coincidence Excel",class="btn-warning btn-block"), br(),
+                  downloadButton(ns("dl_membership"), "⬇  Membership Excel", class="btn-warning btn-block")
+              ),
+              box(title="Overlap Analysis",width=9,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📋 Coincidence Index",    br(), DTOutput(ns("tbl_coincidence"))),
+                    tabPanel("📊 Coincidence Heatmap",  dl_bar(ns("dl_plt_ci_heat")), plotOutput(ns("plt_ci_heat"),height="420px")),
+                    tabPanel("📋 Membership Table",     br(), DTOutput(ns("tbl_membership")))
+                  )
+              )
+            )
     ),
     tabItem("mt_venn",
-      div(class="sec-bar","🔷 MT — Venn Diagram (4-way)"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          actionButton(ns("btn_venn"),"▶  Draw Venn",class="btn-success btn-block",icon=icon("play")), hr(),
-          downloadButton(ns("dl_venn_tbl"),"⬇  Region Table Excel",class="btn-warning btn-block")
-        ),
-        box(title="Venn Diagram",width=9,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("🔷 Venn Diagram", dl_bar(ns("dl_plt_venn")), plotOutput(ns("plt_venn"),height="500px")),
-            tabPanel("📋 Region Summary", br(), DTOutput(ns("tbl_venn")))
-          )
-        )
-      )
+            div(class="sec-bar","🔷 MT — Venn Diagram (4-way)"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  actionButton(ns("btn_venn"),"▶  Draw Venn",class="btn-success btn-block",icon=icon("play")), hr(),
+                  downloadButton(ns("dl_venn_tbl"),"⬇  Region Table Excel",class="btn-warning btn-block")
+              ),
+              box(title="Venn Diagram",width=9,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("🔷 Venn Diagram", dl_bar(ns("dl_plt_venn")), plotOutput(ns("plt_venn"),height="500px")),
+                    tabPanel("📋 Region Summary", br(), DTOutput(ns("tbl_venn")))
+                  )
+              )
+            )
     ),
     tabItem("mt_biplots",
-      div(class="sec-bar","📉 MT — GT / GYT Biplots"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          numericInput(ns("n_highlight"),"Top genotypes to label:",12,min=1,max=50),
-          actionButton(ns("btn_biplot"),"▶  Build Biplots",class="btn-success btn-block",icon=icon("play"))
-        ),
-        box(title="Biplots",width=9,status="success",solidHeader=TRUE,
-          tabsetPanel(
-            tabPanel("📊 GT Biplot",      dl_bar(ns("dl_plt_gt")),       plotOutput(ns("plt_gt"),height="460px")),
-            tabPanel("📊 GYT Biplot",     dl_bar(ns("dl_plt_gyt")),      plotOutput(ns("plt_gyt"),height="460px")),
-            tabPanel("📊 Combined GT+GYT",dl_bar(ns("dl_plt_combined")), plotOutput(ns("plt_combined"),height="460px"))
-          )
-        )
-      )
+            div(class="sec-bar","📉 MT — GT / GYT Biplots"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  numericInput(ns("n_highlight"),"Top genotypes to label:",12,min=1,max=50),
+                  actionButton(ns("btn_biplot"),"▶  Build Biplots",class="btn-success btn-block",icon=icon("play"))
+              ),
+              box(title="Biplots",width=9,status="success",solidHeader=TRUE,
+                  tabsetPanel(
+                    tabPanel("📊 GT Biplot",      dl_bar(ns("dl_plt_gt")),       plotOutput(ns("plt_gt"),height="460px")),
+                    tabPanel("📊 GYT Biplot",     dl_bar(ns("dl_plt_gyt")),      plotOutput(ns("plt_gyt"),height="460px")),
+                    tabPanel("📊 Combined GT+GYT",dl_bar(ns("dl_plt_combined")), plotOutput(ns("plt_combined"),height="460px"))
+                  )
+              )
+            )
     ),
     tabItem("mt_radar",
-      div(class="sec-bar","🌟 MT — Radar Chart"),
-      fluidRow(
-        box(title="Options",width=3,status="success",solidHeader=TRUE,
-          uiOutput(ns("ui_radar_method")), uiOutput(ns("ui_radar_genotypes")),
-          actionButton(ns("btn_radar"),"▶  Draw Radar",class="btn-success btn-block",icon=icon("play")), hr(),
-          dl_bar(ns("dl_plt_radar"),"⬇  Download HD PDF")
-        ),
-        box(title="Radar Chart",width=9,status="success",solidHeader=TRUE, plotOutput(ns("plt_radar"),height="500px"))
-      )
+            div(class="sec-bar","🌟 MT — Radar Chart"),
+            fluidRow(
+              box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  uiOutput(ns("ui_radar_method")), uiOutput(ns("ui_radar_genotypes")),
+                  actionButton(ns("btn_radar"),"▶  Draw Radar",class="btn-success btn-block",icon=icon("play")), hr(),
+                  dl_bar(ns("dl_plt_radar"),"⬇  Download HD PDF")
+              ),
+              box(title="Radar Chart",width=9,status="success",solidHeader=TRUE, plotOutput(ns("plt_radar"),height="500px"))
+            )
     ),
     tabItem("mt_export",
-      div(class="sec-bar","💾 MT — Export All Results"),
-      fluidRow(
-        box(title="Download Complete Package",width=6,status="success",solidHeader=TRUE,
-          p("Downloads all tables into a single Excel workbook."), br(),
-          downloadButton(ns("dl_all_xlsx"),"📦  Download All Tables (Excel)",class="btn-success btn-block",style="font-size:14px;padding:11px;"),
-          br(), br(), p(style="color:#888;font-size:12px;","Note: Run all analyses first.")
-        ),
-        box(title="Individual Downloads",width=6,status="success",solidHeader=TRUE,
-          fluidRow(
-            column(6, downloadButton(ns("dl_blup_mat"),"BLUP Matrix",class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_table2_ex"),"Table 2 (Var Comp)",class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_table3_ex"),"Table 3 (Sel Diff)",class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_mtsi_ex"),  "MTSI Index",class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_mgidi_ex"), "MGIDI Index",class="btn-warning btn-block")),
-            column(6, downloadButton(ns("dl_fai_ex"),   "FAI-BLUP Index",class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_sh_ex"),    "Smith-Hazel Index",class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_coincid_ex"),"Coincidence Index",class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_member_ex"),"Membership Table",class="btn-warning btn-block"), br(),
-                      downloadButton(ns("dl_venn_ex"),  "Venn Regions",class="btn-warning btn-block"))
-          )
-        )
-      )
+            div(class="sec-bar","💾 MT — Export All Results"),
+            fluidRow(
+              box(title="Download Complete Package",width=6,status="success",solidHeader=TRUE,
+                  p("Downloads all tables into a single Excel workbook."), br(),
+                  downloadButton(ns("dl_all_xlsx"),"📦  Download All Tables (Excel)",class="btn-success btn-block",style="font-size:14px;padding:11px;"),
+                  br(), br(), p(style="color:#888;font-size:12px;","Note: Run all analyses first.")
+              ),
+              box(title="Download All (ZIP)",width=6,status="success",solidHeader=TRUE,
+                  p("Bundles the combined Excel workbook above plus every plot (PDF) from the indices/biplots you have actually run \u2014 nothing else is included."), br(),
+                  downloadButton(ns("dl_all_zip"),"\U0001F4E6  Download All Results (.zip)",class="btn-success btn-block",style="font-size:14px;padding:11px;"),
+                  br(), br(), uiOutput(ns("export_status_ui"))
+              )
+            ),
+            fluidRow(
+              box(title="Individual Downloads",width=12,status="success",solidHeader=TRUE,
+                  fluidRow(
+                    column(6, downloadButton(ns("dl_blup_mat"),"BLUP Matrix",class="btn-warning btn-block"), br(),
+                           downloadButton(ns("dl_table2_ex"),"Table 2 (Var Comp)",class="btn-warning btn-block"), br(),
+                           downloadButton(ns("dl_table3_ex"),"Table 3 (Sel Diff)",class="btn-warning btn-block"), br(),
+                           downloadButton(ns("dl_mtsi_ex"),  "MTSI Index",class="btn-warning btn-block"), br(),
+                           downloadButton(ns("dl_mgidi_ex"), "MGIDI Index",class="btn-warning btn-block")),
+                    column(6, downloadButton(ns("dl_fai_ex"),   "FAI-BLUP Index",class="btn-warning btn-block"), br(),
+                           downloadButton(ns("dl_sh_ex"),    "Smith-Hazel Index",class="btn-warning btn-block"), br(),
+                           downloadButton(ns("dl_coincid_ex"),"Coincidence Index",class="btn-warning btn-block"), br(),
+                           downloadButton(ns("dl_member_ex"),"Membership Table",class="btn-warning btn-block"), br(),
+                           downloadButton(ns("dl_venn_ex"),  "Venn Regions",class="btn-warning btn-block"))
+                  )
+              )
+            )
     )
   )
 }
@@ -1830,10 +2595,10 @@ mtServer <- function(id) {
     processed_data <- reactiveVal(NULL)
     gamem_r        <- reactiveVal(NULL)
     waasb_r        <- reactiveVal(NULL)
-
+    
     mt_valmsg <- reactiveVal(NULL)
     output$val_alert_mt <- renderUI({ mt_valmsg() })
-
+    
     observeEvent(input$file1, {
       mt_valmsg(NULL)
       req(input$file1)
@@ -1915,11 +2680,11 @@ mtServer <- function(id) {
         showNotification("\u2705 MT data processed and validated!",type="message",duration=3)
     })
     output$value_boxes <- renderUI({ req(processed_data()); df<-processed_data(); trs<-selected_traits_r()
-      fluidRow(valueBox(nlevels(df$ENV),"Environments",icon=icon("leaf"),color="green",width=3),valueBox(nlevels(df$GEN),"Genotypes",icon=icon("seedling"),color="teal",width=3),valueBox(nlevels(df$REP),"Replications",icon=icon("clone"),color="orange",width=3),valueBox(length(trs),"Traits",icon=icon("dna"),color="purple",width=3)) })
+    fluidRow(valueBox(nlevels(df$ENV),"Environments",icon=icon("leaf"),color="green",width=3),valueBox(nlevels(df$GEN),"Genotypes",icon=icon("seedling"),color="teal",width=3),valueBox(nlevels(df$REP),"Replications",icon=icon("clone"),color="orange",width=3),valueBox(length(trs),"Traits",icon=icon("dna"),color="purple",width=3)) })
     output$tbl_preview_mini   <- renderDT({ req(processed_data()); datatable(head(processed_data(),20),options=list(scrollX=TRUE,pageLength=8,dom="t"),rownames=FALSE) })
     output$ui_selected_traits_display <- renderUI({ req(selected_traits_r()); p(style="color:#555;font-size:12px;",paste(selected_traits_r(),collapse=" · ")) })
     output$ui_goals_display   <- renderUI({ req(trait_goal_r()); g<-trait_goal_r(); p(style="color:#555;font-size:12px;",paste(names(g),ifelse(g=="h","↑","↓"),collapse=" | ")) })
-
+    
     observeEvent(input$btn_fit, {
       req(processed_data(),selected_traits_r(),trait_goal_r())
       df<-processed_data(); trs<-selected_traits_r(); goals<-trait_goal_r()
@@ -1939,11 +2704,11 @@ mtServer <- function(id) {
     output$txt_gamem <- renderPrint({ req(gamem_r()); tryCatch(print(gamem_r()),error=function(e)cat("Error:",e$message)) })
     output$txt_waasb <- renderPrint({ req(waasb_r()); tryCatch(print(waasb_r()),error=function(e)cat("Error:",e$message)) })
     output$tbl_blup  <- renderDT({ req(blup_mat_r()); fmt_dt(as.data.frame(blup_mat_r())) })
-
+    
     table2_r <- eventReactive(input$btn_table2, { req(gamem_r(),processed_data(),selected_traits_r()); tryCatch(build_table2(gamem_r(),processed_data(),selected_traits_r()),error=function(e)NULL) })
     output$tbl_varcomp <- renderDT({ req(table2_r()); fmt_dt(as.data.frame(table2_r())) })
     output$dl_table2   <- downloadHandler(paste0("Table2_VarComp_",Sys.Date(),".xlsx"), function(f){ req(table2_r()); write_xlsx(as.data.frame(table2_r()),f) })
-
+    
     mtsi_r <- eventReactive(input$btn_mtsi, { req(waasb_r()); tryCatch(mtsi(waasb_r(),SI=input$sel_intensity),error=function(e){ showNotification(paste("MTSI error:",e$message),type="error");NULL }) })
     output$tbl_mtsi     <- renderDT({ req(mtsi_r()); fmt_dt(safe_df(mtsi_r()$MTSI)) })
     output$txt_mtsi_sel <- renderPrint({ req(mtsi_r()); cat("Selected genotypes:\n"); print(as.character(mtsi_r()$sel_gen)) })
@@ -1968,7 +2733,7 @@ mtServer <- function(id) {
     })
     output$dl_mtsi_idx     <- downloadHandler(paste0("MTSI_index_",Sys.Date(),".xlsx"), function(f){ req(mtsi_r()); write_xlsx(safe_df(mtsi_r()$MTSI),f) })
     output$dl_mtsi_contrib <- downloadHandler(paste0("MTSI_contrib_",Sys.Date(),".xlsx"), function(f){ req(mtsi_r()); write_xlsx(safe_df(mtsi_r()$contri_fac),f) })
-
+    
     mgidi_r <- eventReactive(input$btn_mgidi, { req(gamem_r(),trait_goal_r()); goals<-trait_goal_r(); tryCatch(mgidi(gamem_r(),ideotype=unname(goals),SI=input$sel_intensity,verbose=FALSE),error=function(e){ showNotification(paste("MGIDI error:",e$message),type="error");NULL }) })
     output$tbl_mgidi     <- renderDT({ req(mgidi_r()); fmt_dt(safe_df(mgidi_r()$MGIDI)) })
     output$txt_mgidi_sel <- renderPrint({ req(mgidi_r()); cat("Selected genotypes:\n"); print(as.character(mgidi_r()$sel_gen)) })
@@ -1993,7 +2758,7 @@ mtServer <- function(id) {
     })
     output$dl_mgidi_idx     <- downloadHandler(paste0("MGIDI_index_",Sys.Date(),".xlsx"), function(f){ req(mgidi_r()); write_xlsx(safe_df(mgidi_r()$MGIDI),f) })
     output$dl_mgidi_contrib <- downloadHandler(paste0("MGIDI_contrib_",Sys.Date(),".xlsx"), function(f){ req(mgidi_r()); write_xlsx(safe_df(mgidi_r()$contri_fac),f) })
-
+    
     fai_r <- eventReactive(input$btn_fai, { req(gamem_r(),trait_goal_r()); goals<-trait_goal_r(); di_vec<-ifelse(goals=="l","min","max"); tryCatch(fai_blup(gamem_r(),DI=di_vec,SI=input$sel_intensity,verbose=FALSE),error=function(e){ showNotification(paste("FAI-BLUP error:",e$message),type="error");NULL }) })
     fai_tbl_r   <- reactive({ req(fai_r()); tryCatch(fai_r()$FAI%>%select(Genotype,ID1)%>%arrange(ID1),error=function(e)safe_df(fai_r()$FAI)) })
     fai_selected_r <- reactive({ req(fai_r()); tryCatch(as.character(fai_r()$sel_gen$ID1),error=function(e)character(0)) })
@@ -2005,7 +2770,7 @@ mtServer <- function(id) {
     output$plt_fai_def     <- renderPlot({ req(fai_r()); tryCatch({ p<-plot(fai_r()); print(p) },error=function(e) print(ggplot()+annotate("text",x=.5,y=.5,label=paste("Error:",e$message),size=4)+theme_void())) })
     output$dl_plt_fai_def  <- downloadHandler(paste0("FAIBLUP_default_",Sys.Date(),".pdf"), function(f){ req(fai_r()); cairo_pdf(f,16,10); tryCatch({ p<-plot(fai_r()); print(p) },error=function(e){plot.new();title(e$message)}); dev.off() })
     output$dl_fai_idx      <- downloadHandler(paste0("FAIBLUP_index_",Sys.Date(),".xlsx"), function(f){ req(fai_tbl_r()); write_xlsx(as.data.frame(fai_tbl_r()),f) })
-
+    
     sh_r <- eventReactive(input$btn_sh, { req(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r()); tryCatch(make_sh_index(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r(),input$sel_intensity),error=function(e){ showNotification(paste("Smith-Hazel error:",e$message),type="error");NULL }) })
     output$tbl_sh     <- renderDT({ req(sh_r()); fmt_dt(tryCatch(safe_df(sh_r()$index),error=function(e)data.frame(Error=e$message))) })
     output$txt_sh_sel <- renderPrint({ req(sh_r()); cat("Selected genotypes:\n"); print(tryCatch(as.character(sh_r()$sel_gen),error=function(e)"Error extracting")) })
@@ -2015,53 +2780,53 @@ mtServer <- function(id) {
     output$plt_sh_def     <- renderPlot({ req(sh_r()); tryCatch({ p<-plot(sh_r()); print(p) },error=function(e) print(ggplot()+annotate("text",x=.5,y=.5,label=paste("Error:",e$message),size=4)+theme_void())) })
     output$dl_plt_sh_def  <- downloadHandler(paste0("SmithHazel_default_",Sys.Date(),".pdf"), function(f){ req(sh_r()); cairo_pdf(f,16,10); tryCatch({ p<-plot(sh_r()); print(p) },error=function(e){plot.new();title(e$message)}); dev.off() })
     output$dl_sh_idx      <- downloadHandler(paste0("SmithHazel_index_",Sys.Date(),".xlsx"), function(f){ req(sh_r()); write_xlsx(safe_df(sh_r()$index),f) })
-
+    
     direct_r <- eventReactive(input$btn_direct, { req(blup_mat_r(),trait_goal_r(),input$yield_trait); yt<-input$yield_trait; yt_use<-if(yt %in% names(blup_mat_r())) yt else selected_traits_r()[length(selected_traits_r())]; n_sel<-get_selected_n(nrow(blup_mat_r()),input$sel_intensity); goals<-trait_goal_r(); decreasing<-if(yt_use %in% names(goals)) goals[[yt_use]]=="l" else FALSE
-      if(decreasing) blup_mat_r()%>%arrange(.data[[yt_use]])%>%slice_head(n=n_sel) else blup_mat_r()%>%arrange(desc(.data[[yt_use]]))%>%slice_head(n=n_sel) })
+    if(decreasing) blup_mat_r()%>%arrange(.data[[yt_use]])%>%slice_head(n=n_sel) else blup_mat_r()%>%arrange(desc(.data[[yt_use]]))%>%slice_head(n=n_sel) })
     output$tbl_direct   <- renderDT({ req(direct_r()); fmt_dt(as.data.frame(direct_r())) })
     r_plt_direct <- reactive({ req(blup_mat_r(),direct_r(),input$yield_trait); df<-as.data.frame(blup_mat_r()); yt<-if(input$yield_trait %in% names(df)) input$yield_trait else names(df)[2]; df$Selected<-df$GEN %in% direct_r()$GEN
-      ggplot(df,aes(x=reorder(GEN,-.data[[yt]]),y=.data[[yt]],fill=Selected))+geom_col(color="white",linewidth=.3)+scale_fill_manual(values=c("FALSE"="grey75","TRUE"="#2D6A4F"))+labs(title=paste("Direct Selection on",yt),x="Genotype",y=paste(yt,"(BLUP Predicted)"),fill="Selected")+theme_met()+theme(axis.text.x=element_text(angle=45,hjust=1,size=8)) })
+    ggplot(df,aes(x=reorder(GEN,-.data[[yt]]),y=.data[[yt]],fill=Selected))+geom_col(color="white",linewidth=.3)+scale_fill_manual(values=c("FALSE"="grey75","TRUE"="#2D6A4F"))+labs(title=paste("Direct Selection on",yt),x="Genotype",y=paste(yt,"(BLUP Predicted)"),fill="Selected")+theme_met()+theme(axis.text.x=element_text(angle=45,hjust=1,size=8)) })
     output$plt_direct    <- renderPlot({ req(r_plt_direct()); r_plt_direct() })
     output$dl_plt_direct <- downloadHandler(paste0("DirectSelection_",Sys.Date(),".pdf"), function(f){ req(r_plt_direct()); save_pdf(r_plt_direct(),f,16,10) })
     output$dl_direct     <- downloadHandler(paste0("DirectSelection_",Sys.Date(),".xlsx"), function(f){ req(direct_r()); write_xlsx(as.data.frame(direct_r()),f) })
-
+    
     selected_sets_r <- reactive({ out<-list()
-      if(!is.null(direct_r())) out$DirectSelection <- as.character(direct_r()$GEN)
-      if(!is.null(mtsi_r()))   out$MTSI            <- as.character(mtsi_r()$sel_gen)
-      if(!is.null(mgidi_r()))  out$MGIDI           <- as.character(mgidi_r()$sel_gen)
-      if(!is.null(sh_r()))     out$SmithHazel      <- tryCatch(as.character(sh_r()$sel_gen),error=function(e)character(0))
-      if(!is.null(fai_r()))    out$FAIBLUP         <- fai_selected_r()
-      out })
-
+    if(!is.null(direct_r())) out$DirectSelection <- as.character(direct_r()$GEN)
+    if(!is.null(mtsi_r()))   out$MTSI            <- as.character(mtsi_r()$sel_gen)
+    if(!is.null(mgidi_r()))  out$MGIDI           <- as.character(mgidi_r()$sel_gen)
+    if(!is.null(sh_r()))     out$SmithHazel      <- tryCatch(as.character(sh_r()$sel_gen),error=function(e)character(0))
+    if(!is.null(fai_r()))    out$FAIBLUP         <- fai_selected_r()
+    out })
+    
     table3_r <- eventReactive(input$btn_table3, { req(blup_mat_r(),selected_sets_r(),trait_goal_r()); ss<-selected_sets_r(); req(length(ss)>0); bind_rows(lapply(names(ss),function(nm) selection_differential(blup_mat_r(),ss[[nm]],trait_goal_r(),nm))) })
     output$tbl_table3    <- renderDT({ req(table3_r()); fmt_dt(as.data.frame(table3_r())) })
     r_plt_sd_heat <- reactive({ req(table3_r()); df<-table3_r()
-      ggplot(df,aes(x=Method,y=Trait,fill=SDpercent))+geom_tile(color="white",linewidth=.5)+geom_text(aes(label=paste0(round(SDpercent,1),"%"),color=ifelse(DesiredGain=="Yes","white","#C62828")),size=3,fontface="bold")+scale_fill_gradientn(colors=c("#C62828","#FFECB3","#2D6A4F"),name="SD%")+scale_color_identity()+labs(title="Selection Differential (%) by Method × Trait",x="Selection Method",y="Trait")+theme_met()+theme(axis.text.x=element_text(angle=30,hjust=1)) })
+    ggplot(df,aes(x=Method,y=Trait,fill=SDpercent))+geom_tile(color="white",linewidth=.5)+geom_text(aes(label=paste0(round(SDpercent,1),"%"),color=ifelse(DesiredGain=="Yes","white","#C62828")),size=3,fontface="bold")+scale_fill_gradientn(colors=c("#C62828","#FFECB3","#2D6A4F"),name="SD%")+scale_color_identity()+labs(title="Selection Differential (%) by Method × Trait",x="Selection Method",y="Trait")+theme_met()+theme(axis.text.x=element_text(angle=30,hjust=1)) })
     output$plt_sd_heat    <- renderPlot({ req(r_plt_sd_heat()); r_plt_sd_heat() })
     output$dl_plt_sd_heat <- downloadHandler(paste0("SelDiff_heatmap_",Sys.Date(),".pdf"), function(f){ req(r_plt_sd_heat()); save_pdf(r_plt_sd_heat(),f,16,10) })
     output$dl_table3      <- downloadHandler(paste0("Table3_SelDiff_",Sys.Date(),".xlsx"), function(f){ req(table3_r()); write_xlsx(as.data.frame(table3_r()),f) })
-
+    
     coincidence_r <- eventReactive(input$btn_coincidence, { req(blup_mat_r(),selected_sets_r())
       list(ci=tryCatch(selection_overlap_table(selected_sets_r(),nrow(blup_mat_r())),error=function(e)NULL),
            memb=tryCatch(selection_membership_table(selected_sets_r(),blup_mat_r()$GEN),error=function(e)NULL)) })
     output$tbl_coincidence <- renderDT({ req(coincidence_r()); fmt_dt(as.data.frame(coincidence_r()$ci)) })
     output$tbl_membership  <- renderDT({ req(coincidence_r()); fmt_dt(as.data.frame(coincidence_r()$memb)) })
     r_plt_ci_heat <- reactive({ req(coincidence_r(),coincidence_r()$ci); df<-coincidence_r()$ci
-      ggplot(df,aes(x=Method1,y=Method2,fill=CoincidenceIndex))+geom_tile(color="white",linewidth=.6)+geom_text(aes(label=round(CoincidenceIndex,2)),size=4,fontface="bold",color="white")+scale_fill_gradientn(colors=c("#0D3B2E","#52B788","#F4A300"),name="CI")+labs(title="Coincidence Index Between Selection Methods",x=NULL,y=NULL)+theme_met()+theme(axis.text.x=element_text(angle=30,hjust=1)) })
+    ggplot(df,aes(x=Method1,y=Method2,fill=CoincidenceIndex))+geom_tile(color="white",linewidth=.6)+geom_text(aes(label=round(CoincidenceIndex,2)),size=4,fontface="bold",color="white")+scale_fill_gradientn(colors=c("#0D3B2E","#52B788","#F4A300"),name="CI")+labs(title="Coincidence Index Between Selection Methods",x=NULL,y=NULL)+theme_met()+theme(axis.text.x=element_text(angle=30,hjust=1)) })
     output$plt_ci_heat    <- renderPlot({ req(r_plt_ci_heat()); r_plt_ci_heat() })
     output$dl_plt_ci_heat <- downloadHandler(paste0("CoincidenceIndex_",Sys.Date(),".pdf"), function(f){ req(r_plt_ci_heat()); save_pdf(r_plt_ci_heat(),f,14,10) })
     output$dl_coincidence <- downloadHandler(paste0("CoincidenceIndex_",Sys.Date(),".xlsx"), function(f){ req(coincidence_r()); write_xlsx(as.data.frame(coincidence_r()$ci),f) })
     output$dl_membership  <- downloadHandler(paste0("Membership_",Sys.Date(),".xlsx"), function(f){ req(coincidence_r()); write_xlsx(as.data.frame(coincidence_r()$memb),f) })
-
+    
     venn_r <- eventReactive(input$btn_venn, { req(selected_sets_r()); ss<-selected_sets_r(); four_methods<-c("MTSI","MGIDI","FAIBLUP","SmithHazel"); avail<-intersect(four_methods,names(ss)); validate(need(length(avail)==4,"Need all 4 methods (MTSI, MGIDI, FAI-BLUP, Smith-Hazel) first.")); ss[avail] })
     r_plt_venn <- reactive({ req(venn_r()); tryCatch(make_four_set_venn(venn_r(),"Venn Diagram: MTSI × MGIDI × FAI-BLUP × Smith-Hazel"),error=function(e) ggplot()+annotate("text",x=.5,y=.5,label=paste("Error:",e$message),size=4)+theme_void()) })
     output$plt_venn    <- renderPlot({ req(r_plt_venn()); r_plt_venn() })
     output$dl_plt_venn <- downloadHandler(paste0("Venn_4way_",Sys.Date(),".pdf"), function(f){ req(r_plt_venn()); save_pdf(r_plt_venn(),f,18,16) })
     output$tbl_venn    <- renderDT({ req(venn_r()); fmt_dt(tryCatch(as.data.frame(make_venn_genotype_table(venn_r())),error=function(e)data.frame(Error=e$message))) })
     output$dl_venn_tbl <- downloadHandler(paste0("Venn_regions_",Sys.Date(),".xlsx"), function(f){ req(venn_r()); write_xlsx(list(Regions=as.data.frame(make_venn_genotype_table(venn_r())),Counts=as.data.frame(make_venn_region_table(venn_r()))),f) })
-
+    
     biplot_r <- eventReactive(input$btn_biplot, { req(processed_data(),selected_traits_r(),input$yield_trait); df<-processed_data(); trs<-selected_traits_r(); yt<-if(input$yield_trait %in% names(df)) input$yield_trait else trs[length(trs)]; gm<-df%>%group_by(GEN)%>%summarise(across(all_of(trs),~mean(.x,na.rm=TRUE)),.groups="drop"); other_trs<-setdiff(trs,yt); goals<-trait_goal_r(); gyt_ideo<-unname(goals[other_trs])
-      list(gt_fit=tryCatch(gtb(gm,gen=GEN,resp=all_of(trs)),error=function(e)NULL),gyt_fit=tryCatch(gytb(gm,gen=GEN,yield=!!sym(yt),traits=all_of(other_trs),ideotype=gyt_ideo),error=function(e)NULL),gen_means=gm,yt=yt) })
+    list(gt_fit=tryCatch(gtb(gm,gen=GEN,resp=all_of(trs)),error=function(e)NULL),gyt_fit=tryCatch(gytb(gm,gen=GEN,yield=!!sym(yt),traits=all_of(other_trs),ideotype=gyt_ideo),error=function(e)NULL),gen_means=gm,yt=yt) })
     highlight_gen_r <- reactive({ req(biplot_r(),selected_sets_r(),input$n_highlight); memb<-tryCatch(selection_membership_table(selected_sets_r(),biplot_r()$gen_means$GEN),error=function(e)NULL); if(is.null(memb)) return(head(biplot_r()$gen_means$GEN,input$n_highlight)); yt<-biplot_r()$yt; gm<-biplot_r()$gen_means; top<-memb%>%mutate(GEN=as.character(GEN))%>%left_join(gm%>%mutate(GEN=as.character(GEN))%>%select(GEN,!!sym(yt)),by="GEN")%>%mutate(MethodsSelected=replace_na(MethodsSelected,0))%>%arrange(desc(MethodsSelected),desc(.data[[yt]]))%>%slice_head(n=input$n_highlight)%>%pull(GEN); top })
     r_plt_gt       <- reactive({ req(biplot_r(),biplot_r()$gt_fit);  make_custom_biplot(biplot_r()$gt_fit$mod, highlight_gen_r(), "GT Biplot") })
     r_plt_gyt      <- reactive({ req(biplot_r(),biplot_r()$gyt_fit); make_custom_biplot(biplot_r()$gyt_fit$mod,highlight_gen_r(), "GYT Biplot") })
@@ -2072,17 +2837,85 @@ mtServer <- function(id) {
     output$dl_plt_gt       <- downloadHandler(paste0("GT_biplot_",Sys.Date(),".pdf"),       function(f){ req(r_plt_gt());       save_pdf(r_plt_gt(),f,14,12) })
     output$dl_plt_gyt      <- downloadHandler(paste0("GYT_biplot_",Sys.Date(),".pdf"),      function(f){ req(r_plt_gyt());      save_pdf(r_plt_gyt(),f,14,12) })
     output$dl_plt_combined <- downloadHandler(paste0("GT_GYT_combined_",Sys.Date(),".pdf"), function(f){ req(r_plt_combined()); save_pdf(r_plt_combined(),f,20,12) })
-
+    
     output$ui_radar_method    <- renderUI({ req(selected_sets_r()); selectInput(session$ns("radar_method"),"Source method:",choices=names(selected_sets_r()),selected=names(selected_sets_r())[1]) })
     output$ui_radar_genotypes <- renderUI({ req(selected_sets_r(),input$radar_method); genos<-tryCatch(selected_sets_r()[[input$radar_method]],error=function(e)character(0)); checkboxGroupInput(session$ns("radar_genotypes"),"Select genotypes (2-5):",choices=head(genos,10),selected=head(genos,3)) })
     radar_contrib_r <- reactive({ req(input$radar_method,mgidi_r(),mtsi_r()); if(input$radar_method %in% c("MGIDI","DirectSelection")){ req(mgidi_r()); mgidi_r()$contri_fac } else { req(mtsi_r()); mtsi_r()$contri_fac } })
     output$plt_radar <- renderPlot({ req(input$btn_radar>0,isolate(radar_contrib_r()),isolate(input$radar_genotypes)); genos<-isolate(input$radar_genotypes); contrib<-isolate(radar_contrib_r())
-      validate(need(length(genos)>=2&&length(genos)<=5,"Please select 2–5 genotypes."))
-      tryCatch({ df<-as.data.frame(contrib); if("GEN" %in% colnames(df)) df<-df%>%rename(Genotype=GEN) else df<-df%>%tibble::rownames_to_column("Genotype"); df<-df%>%filter(Genotype %in% genos); df_num<-df%>%select(where(is.numeric)); rownames(df_num)<-df$Genotype; max_v<-apply(df_num,2,max); min_v<-apply(df_num,2,min); radar_df<-rbind(max_v,min_v,df_num); pal<-c("#2D6A4F","#E65100","#1565C0","#AD1457","#4527A0")[seq_len(nrow(df_num))]; par(mar=c(1,1,3,1),bg="white"); fmsb::radarchart(radar_df,axistype=1,pcol=pal,plwd=3,plty=1,pfcol=scales::alpha(pal,.18),cglcol="grey80",cglty=1,axislabcol="#1B4332",vlcex=1.2); title(main=paste("Strength & Weakness —",input$radar_method),col.main="#0D3B2E",font.main=2,cex.main=1.4); legend("bottom",legend=rownames(df_num),col=pal,lty=1,lwd=3,bty="n",cex=1.1,horiz=TRUE) },error=function(e){ plot.new(); text(.5,.5,paste("Radar Error:",e$message),cex=1.2,col="#C62828") }) })
+    validate(need(length(genos)>=2&&length(genos)<=5,"Please select 2–5 genotypes."))
+    tryCatch({ df<-as.data.frame(contrib); if("GEN" %in% colnames(df)) df<-df%>%rename(Genotype=GEN) else df<-df%>%tibble::rownames_to_column("Genotype"); df<-df%>%filter(Genotype %in% genos); df_num<-df%>%select(where(is.numeric)); rownames(df_num)<-df$Genotype; max_v<-apply(df_num,2,max); min_v<-apply(df_num,2,min); radar_df<-rbind(max_v,min_v,df_num); pal<-c("#2D6A4F","#E65100","#1565C0","#AD1457","#4527A0")[seq_len(nrow(df_num))]; par(mar=c(1,1,3,1),bg="white"); fmsb::radarchart(radar_df,axistype=1,pcol=pal,plwd=3,plty=1,pfcol=scales::alpha(pal,.18),cglcol="grey80",cglty=1,axislabcol="#1B4332",vlcex=1.2); title(main=paste("Strength & Weakness —",input$radar_method),col.main="#0D3B2E",font.main=2,cex.main=1.4); legend("bottom",legend=rownames(df_num),col=pal,lty=1,lwd=3,bty="n",cex=1.1,horiz=TRUE) },error=function(e){ plot.new(); text(.5,.5,paste("Radar Error:",e$message),cex=1.2,col="#C62828") }) })
     output$dl_plt_radar <- downloadHandler(paste0("Radar_chart_",Sys.Date(),".pdf"), function(f){ req(radar_contrib_r(),input$radar_genotypes); genos<-input$radar_genotypes; contrib<-radar_contrib_r(); cairo_pdf(f,14,12); tryCatch({ df<-as.data.frame(contrib); if("GEN" %in% colnames(df)) df<-df%>%rename(Genotype=GEN) else df<-df%>%tibble::rownames_to_column("Genotype"); df<-df%>%filter(Genotype %in% genos); df_num<-df%>%select(where(is.numeric)); rownames(df_num)<-df$Genotype; max_v<-apply(df_num,2,max); min_v<-apply(df_num,2,min); radar_df<-rbind(max_v,min_v,df_num); pal<-c("#2D6A4F","#E65100","#1565C0","#AD1457","#4527A0")[seq_len(nrow(df_num))]; par(mar=c(1,1,4,1),bg="white"); fmsb::radarchart(radar_df,axistype=1,pcol=pal,plwd=3,plty=1,pfcol=scales::alpha(pal,.18),cglcol="grey80",cglty=1,axislabcol="#1B4332",vlcex=1.3); title(main=paste("Strength & Weakness —",input$radar_method),col.main="#0D3B2E",font.main=2,cex.main=1.5); legend("bottom",legend=rownames(df_num),col=pal,lty=1,lwd=3,bty="n",cex=1.1,horiz=TRUE) },error=function(e){ plot.new(); text(.5,.5,paste("Error:",e$message)) }); dev.off() })
-
+    
     mk_safe <- function(x) tryCatch(as.data.frame(x),error=function(e)data.frame(Error=e$message))
     output$dl_all_xlsx <- downloadHandler(paste0("MultiTrait_Analysis_",Sys.Date(),".xlsx"), function(f){ sheets<-list(); if(!is.null(blup_mat_r())) sheets$BLUP_Matrix<-mk_safe(blup_mat_r()); if(!is.null(table2_r())) sheets$Table2_VarComp<-mk_safe(table2_r()); if(!is.null(table3_r())) sheets$Table3_SelDiff<-mk_safe(table3_r()); if(!is.null(mtsi_r())) sheets$MTSI_Index<-mk_safe(mtsi_r()$MTSI); if(!is.null(mgidi_r())) sheets$MGIDI_Index<-mk_safe(mgidi_r()$MGIDI); if(!is.null(fai_r())) sheets$FAIBLUP_Index<-mk_safe(fai_r()$FAI); if(!is.null(sh_r())) sheets$SmithHazel_Index<-mk_safe(sh_r()$index); if(!is.null(coincidence_r()$ci)) sheets$CoincidenceIndex<-mk_safe(coincidence_r()$ci); if(!is.null(coincidence_r()$memb)) sheets$Membership_Table<-mk_safe(coincidence_r()$memb); if(length(sheets)==0) sheets$Info<-data.frame(Message="No analyses completed yet."); write_xlsx(sheets,f) })
+    
+    # ════════════════════════════════════════════════════════════
+    #  DYNAMIC EXPORT — Module 3 (MT): bundles the combined Excel
+    #  workbook plus every plot that has actually been generated.
+    #  safe_get() turns an un-triggered reactive()'s silent error
+    #  into a plain NULL so we can branch on "has this been run".
+    # ════════════════════════════════════════════════════════════
+    safe_get <- function(r) tryCatch(r(), error=function(e) NULL)
+    
+    output$export_status_ui <- renderUI({
+      items <- list(
+        c("BLUP / GAMEM",     !is.null(safe_get(gamem_r))),
+        c("MTSI",             !is.null(safe_get(mtsi_r))),
+        c("MGIDI",            !is.null(safe_get(mgidi_r))),
+        c("FAI-BLUP",         !is.null(safe_get(fai_r))),
+        c("Smith-Hazel",      !is.null(safe_get(sh_r))),
+        c("Coincidence Index",!is.null(safe_get(coincidence_r))),
+        c("GT / GYT Biplots", !is.null(safe_get(biplot_r)))
+      )
+      div(style="display:flex;flex-wrap:wrap;gap:10px;",
+          lapply(items, function(it) {
+            done <- isTRUE(as.logical(it[2]))
+            span(style=paste0("padding:6px 12px;border-radius:14px;font-size:12px;font-weight:600;",
+                              if (done) "background:#e3f5e9;color:#155d34;" else "background:#f1f1f1;color:#888;"),
+                 paste0(if (done) "\u2705 " else "\u23F3 ", it[1]))
+          })
+      )
+    })
+    
+    output$dl_all_zip <- downloadHandler(
+      filename = function() paste0("MT_Module3_Results_", Sys.Date(), ".zip"),
+      content = function(file) {
+        items <- list()
+        sheets <- list()
+        if (!is.null(safe_get(blup_mat_r)))    sheets$BLUP_Matrix     <- mk_safe(blup_mat_r())
+        if (!is.null(safe_get(table2_r)))      sheets$Table2_VarComp  <- mk_safe(table2_r())
+        if (!is.null(safe_get(table3_r)))      sheets$Table3_SelDiff  <- mk_safe(table3_r())
+        if (!is.null(safe_get(mtsi_r)))        sheets$MTSI_Index      <- mk_safe(mtsi_r()$MTSI)
+        if (!is.null(safe_get(mgidi_r)))       sheets$MGIDI_Index     <- mk_safe(mgidi_r()$MGIDI)
+        if (!is.null(safe_get(fai_r)))         sheets$FAIBLUP_Index   <- mk_safe(fai_r()$FAI)
+        if (!is.null(safe_get(sh_r)))          sheets$SmithHazel_Index<- mk_safe(sh_r()$index)
+        cc <- safe_get(coincidence_r)
+        if (!is.null(cc$ci))   sheets$CoincidenceIndex <- mk_safe(cc$ci)
+        if (!is.null(cc$memb)) sheets$Membership_Table  <- mk_safe(cc$memb)
+        if (length(sheets) > 0) items$workbook <- list(filename="MultiTrait_Analysis_Tables.xlsx", write=function(p) write_xlsx(sheets, p))
+        
+        add_plot <- function(key, r, filename, w=14, h=12) {
+          pl <- safe_get(r)
+          if (!is.null(pl)) items[[key]] <<- list(filename=filename, write=function(p) save_pdf(pl, p, w, h))
+        }
+        add_plot("mtsi_circ",     r_plt_mtsi_circ,     "MTSI_Circular.pdf", 14, 14)
+        add_plot("mtsi_contrib",  r_plt_mtsi_contrib,  "MTSI_Contribution.pdf", 14, 9)
+        add_plot("mgidi_circ",    r_plt_mgidi_circ,    "MGIDI_Circular.pdf", 14, 14)
+        add_plot("mgidi_contrib", r_plt_mgidi_contrib, "MGIDI_Contribution.pdf", 14, 9)
+        add_plot("fai_circ",      r_plt_fai_circ,      "FAIBLUP_Circular.pdf", 14, 14)
+        add_plot("sh_circ",       r_plt_sh_circ,       "SmithHazel_Circular.pdf", 14, 14)
+        add_plot("direct",        r_plt_direct,        "DirectSelection.pdf", 16, 10)
+        add_plot("sd_heat",       r_plt_sd_heat,       "SelDiff_Heatmap.pdf", 16, 10)
+        add_plot("ci_heat",       r_plt_ci_heat,       "CoincidenceIndex.pdf", 14, 10)
+        add_plot("venn",          r_plt_venn,          "Venn_4way.pdf", 18, 16)
+        add_plot("gt",            r_plt_gt,            "GT_Biplot.pdf", 14, 12)
+        add_plot("gyt",           r_plt_gyt,            "GYT_Biplot.pdf", 14, 12)
+        add_plot("combined",      r_plt_combined,      "GT_GYT_Combined.pdf", 20, 12)
+        
+        build_zip_export(items, file)
+      },
+      contentType = "application/zip"
+    )
     mk_dl <- function(btn_id,get_df,fn_base){ output[[btn_id]] <- downloadHandler(paste0(fn_base,"_",Sys.Date(),".xlsx"),function(f){ df<-get_df(); req(!is.null(df)); write_xlsx(mk_safe(df),f) }) }
     mk_dl("dl_blup_mat",  function()blup_mat_r(),       "BLUP_Matrix")
     mk_dl("dl_table2_ex", function()table2_r(),         "Table2_VarComp")
@@ -2102,68 +2935,70 @@ mtServer <- function(id) {
 # ════════════════════════════════════════════════════════════════
 ui <- dashboardPage(
   skin = "green", title = "Plant Breeding Analytics Suite",
-
+  
   dashboardHeader(
     title = div(
       div(style="font-family:'Playfair Display',serif;font-size:14px;color:#95D5B2;line-height:1.2;","🌾 Plant Breeding Suite"),
       div(style="font-size:9.5px;color:#74C69D;letter-spacing:.8px;font-weight:600;","D² · MET · MULTI-TRAIT")
     ), titleWidth = 230
   ),
-
+  
   dashboardSidebar(width = 230,
-    sidebarMenu(id = "main_menu",
-      # ── D² Analysis ──────────────────────────────────────
-      tags$li(class="suite-divider", "🌿 D² Genetic Diversity"),
-      menuItem("📁  Data Upload",    tabName="d2_upload",  icon=icon("upload")),
-      menuItem("📊  MANOVA",         tabName="d2_manova",  icon=icon("chart-bar")),
-      menuItem("📐  D² Distances",   tabName="d2_d2",      icon=icon("ruler-combined")),
-      menuItem("🌐  Tocher Cluster", tabName="d2_tocher",  icon=icon("project-diagram")),
-      menuItem("📈  PCA",            tabName="d2_pca",     icon=icon("dot-circle")),
-      menuItem("🔗  Correlation",    tabName="d2_corr",    icon=icon("link")),
-      menuItem("📦  D² Export",      tabName="d2_export",  icon=icon("download")),
-      # ── MET Analysis ─────────────────────────────────────
-      tags$li(class="suite-divider", "🌾 MET Analysis"),
-      menuItem("🏠  MET Home",        tabName="met_home",       icon=icon("home")),
-      menuItem("📂  MET Data",        tabName="met_data",       icon=icon("database")),
-      menuItem("📊  Descriptive",     tabName="met_desc",       icon=icon("chart-bar")),
-      menuItem("📈  Mean Performance",tabName="met_mean",       icon=icon("line-chart")),
-      menuItem("🔬  ANOVA",           tabName="met_anova",      icon=icon("flask")),
-      menuItem("📉  Stability",       tabName="met_stab_anova", icon=icon("balance-scale"),
-        menuSubItem("ANOVA-based",      tabName="met_stab_anova"),
-        menuSubItem("Regression",       tabName="met_stab_reg"),
-        menuSubItem("Non-parametric",   tabName="met_stab_np"),
-        menuSubItem("Factor Analysis",  tabName="met_stab_fa"),
-        menuSubItem("Wrap Parameters",  tabName="met_stab_wrap")
-      ),
-      menuItem("🎯  AMMI",            tabName="met_ammi",  icon=icon("bullseye")),
-      menuItem("🌐  GGE",             tabName="met_gge",   icon=icon("globe")),
-      # ── Multi-Trait ───────────────────────────────────────
-      tags$li(class="suite-divider", "🧬 Multi-Trait Selection"),
-      menuItem("🏠  MT Home",         tabName="mt_home",       icon=icon("home")),
-      menuItem("📂  Data & Settings", tabName="mt_data",       icon=icon("cog")),
-      menuItem("⚙️  Fit Models",      tabName="mt_fit",        icon=icon("cogs")),
-      menuItem("📊  Variance Comp.",  tabName="mt_varcomp",    icon=icon("table")),
-      menuItem("🎯  MTSI",            tabName="mt_mtsi",       icon=icon("bullseye")),
-      menuItem("🧬  MGIDI",           tabName="mt_mgidi",      icon=icon("dna")),
-      menuItem("🔢  FAI-BLUP",        tabName="mt_fai",        icon=icon("calculator")),
-      menuItem("⚖️  Smith-Hazel",     tabName="mt_sh",         icon=icon("balance-scale")),
-      menuItem("📈  Direct Select.",  tabName="mt_direct",     icon=icon("arrow-up")),
-      menuItem("🔗  Selection Summary", tabName="mt_table3",  icon=icon("list-check"),
-        menuSubItem("Selection Diff. (Table 3)", tabName="mt_table3"),
-        menuSubItem("Coincidence Index",         tabName="mt_coincidence"),
-        menuSubItem("Membership & Venn",         tabName="mt_venn")
-      ),
-      menuItem("📉  GT/GYT Biplots",  tabName="mt_biplots",    icon=icon("chart-line")),
-      menuItem("🌟  Radar Chart",     tabName="mt_radar",      icon=icon("star")),
-      menuItem("💾  MT Export",       tabName="mt_export",     icon=icon("download")),
-      # ── About ─────────────────────────────────────────────
-      tags$li(class="suite-divider", "ℹ️ Information"),
-      menuItem("ℹ️  About",           tabName="about",     icon=icon("info-circle"))
-    ),
-    div(style="position:absolute;bottom:0;width:100%;padding:8px 12px;background:rgba(0,0,0,.3);font-size:9.5px;color:#52B788;border-top:1px solid rgba(82,183,136,.2);line-height:1.6;",
-        "Dr. V.K. Meena | AU Jodhpur")
+                   sidebarMenu(id = "main_menu",
+                               # ── D² Analysis ──────────────────────────────────────
+                               tags$li(class="suite-divider", "🌿 D² Genetic Diversity"),
+                               menuItem("📁  Data Upload",    tabName="d2_upload",  icon=icon("upload")),
+                               menuItem("🧮  Genotypic Values", tabName="d2_genoval", icon=icon("calculator")),
+                               menuItem("📊  MANOVA",         tabName="d2_manova",  icon=icon("chart-bar")),
+                               menuItem("📐  D² Distances",   tabName="d2_d2",      icon=icon("ruler-combined")),
+                               menuItem("🌐  Tocher Cluster", tabName="d2_tocher",  icon=icon("project-diagram")),
+                               menuItem("📈  PCA",            tabName="d2_pca",     icon=icon("dot-circle")),
+                               menuItem("🔗  Correlation",    tabName="d2_corr",    icon=icon("link")),
+                               menuItem("📦  D² Export",      tabName="d2_export",  icon=icon("download")),
+                               # ── MET Analysis ─────────────────────────────────────
+                               tags$li(class="suite-divider", "🌾 MET Analysis"),
+                               menuItem("🏠  MET Home",        tabName="met_home",       icon=icon("home")),
+                               menuItem("📂  MET Data",        tabName="met_data",       icon=icon("database")),
+                               menuItem("📊  Descriptive",     tabName="met_desc",       icon=icon("chart-bar")),
+                               menuItem("📈  Mean Performance",tabName="met_mean",       icon=icon("line-chart")),
+                               menuItem("🔬  ANOVA",           tabName="met_anova",      icon=icon("flask")),
+                               menuItem("📉  Stability",       tabName="met_stab_anova", icon=icon("balance-scale"),
+                                        menuSubItem("ANOVA-based",      tabName="met_stab_anova"),
+                                        menuSubItem("Regression",       tabName="met_stab_reg"),
+                                        menuSubItem("Non-parametric",   tabName="met_stab_np"),
+                                        menuSubItem("Factor Analysis",  tabName="met_stab_fa"),
+                                        menuSubItem("Wrap Parameters",  tabName="met_stab_wrap")
+                               ),
+                               menuItem("🎯  AMMI",            tabName="met_ammi",  icon=icon("bullseye")),
+                               menuItem("🌐  GGE",             tabName="met_gge",   icon=icon("globe")),
+                               menuItem("📦  Export",          tabName="met_export",icon=icon("download")),
+                               # ── Multi-Trait ───────────────────────────────────────
+                               tags$li(class="suite-divider", "🧬 Multi-Trait Selection"),
+                               menuItem("🏠  MT Home",         tabName="mt_home",       icon=icon("home")),
+                               menuItem("📂  Data & Settings", tabName="mt_data",       icon=icon("cog")),
+                               menuItem("⚙️  Fit Models",      tabName="mt_fit",        icon=icon("cogs")),
+                               menuItem("📊  Variance Comp.",  tabName="mt_varcomp",    icon=icon("table")),
+                               menuItem("🎯  MTSI",            tabName="mt_mtsi",       icon=icon("bullseye")),
+                               menuItem("🧬  MGIDI",           tabName="mt_mgidi",      icon=icon("dna")),
+                               menuItem("🔢  FAI-BLUP",        tabName="mt_fai",        icon=icon("calculator")),
+                               menuItem("⚖️  Smith-Hazel",     tabName="mt_sh",         icon=icon("balance-scale")),
+                               menuItem("📈  Direct Select.",  tabName="mt_direct",     icon=icon("arrow-up")),
+                               menuItem("🔗  Selection Summary", tabName="mt_table3",  icon=icon("list-check"),
+                                        menuSubItem("Selection Diff. (Table 3)", tabName="mt_table3"),
+                                        menuSubItem("Coincidence Index",         tabName="mt_coincidence"),
+                                        menuSubItem("Membership & Venn",         tabName="mt_venn")
+                               ),
+                               menuItem("📉  GT/GYT Biplots",  tabName="mt_biplots",    icon=icon("chart-line")),
+                               menuItem("🌟  Radar Chart",     tabName="mt_radar",      icon=icon("star")),
+                               menuItem("💾  MT Export",       tabName="mt_export",     icon=icon("download")),
+                               # ── About ─────────────────────────────────────────────
+                               tags$li(class="suite-divider", "ℹ️ Information"),
+                               menuItem("ℹ️  About",           tabName="about",     icon=icon("info-circle"))
+                   ),
+                   div(style="position:absolute;bottom:0;width:100%;padding:8px 12px;background:rgba(0,0,0,.3);font-size:9.5px;color:#52B788;border-top:1px solid rgba(82,183,136,.2);line-height:1.6;",
+                       "Dr. V.K. Meena | AU Jodhpur")
   ),
-
+  
   dashboardBody(
     APP_CSS,
     do.call(tabItems, c(
@@ -2175,46 +3010,46 @@ ui <- dashboardPage(
       as.list(mtUI("mt")),
       # ── About tab ──────────────────────────────────────
       list(tabItem("about",
-        div(class="sec-bar","ℹ️ About — Plant Breeding Analytics Suite"),
-        fluidRow(
-          column(6,
-            div(class="dev-card",
-              div(class="dev-name","Dr. Vijay Kamal Meena"),
-              div(class="dev-role","Assistant Professor (GPB) | Agriculture University Jodhpur"),
-              hr(style="border:none;border-top:1px solid rgba(255,255,255,.15);margin:12px 0;"),
-              div(class="cr",tags$i(class="fa fa-graduation-cap"),"M.Sc. & Ph.D. — ICAR-IARI, New Delhi"),
-              div(class="cr",tags$i(class="fa fa-award"),         "ICAR-ARS 2021"),
-              div(class="cr",tags$i(class="fa fa-university"),    "Agri. Research Sub-Station Sumerpur (Pali)"),
-              div(class="cr",tags$i(class="fa fa-building"),      "Agriculture University Jodhpur"),
-              div(class="cr",tags$i(class="fa fa-envelope"),      "vjkamal93@gmail.com"),
-              div(class="cr",tags$i(class="fa fa-envelope"),      "vijaykamal@aujodhpur.ac.in"),
-              div(class="cr",tags$i(class="fa fa-phone"),         "+91 9449509856"),
-              div(class="tags",
-                  span(class="tag","Plant Breeding"),   span(class="tag","Quantitative Genetics"),
-                  span(class="tag","GxE Interaction"),  span(class="tag","MET Analysis"),
-                  span(class="tag","AMMI"), span(class="tag","GGE Biplot"), span(class="tag","MTSI"),
-                  span(class="tag","MGIDI"), span(class="tag","FAI-BLUP"), span(class="tag","D² Analysis"),
-                  span(class="tag","R Programming"), span(class="tag","Bioinformatics"))
-            )
-          ),
-          column(6,
-            box(title="About This Suite", width=12, status="success", solidHeader=TRUE,
-              p("A unified professional Shiny dashboard combining three analytical modules for plant breeding research:"),
-              br(),
-              h4(style="color:#1B4332;","Module 1 — D² Genetic Diversity Analyser"),
-              tags$ul(tags$li("Mahalanobis D² distance matrix"),tags$li("MANOVA & univariate ANOVA"),tags$li("Tocher clustering, dendrogram, network plot"),tags$li("PCA biplot with cluster overlay"),tags$li("Pearson correlation heatmap")),
-              br(),
-              h4(style="color:#1B4332;","Module 2 — MET Analysis (AMMI/GGE)"),
-              tags$ul(tags$li("Descriptive statistics, GxE heatmap"),tags$li("Individual + pooled ANOVA, Bartlett test"),tags$li("ANOVA, regression & non-parametric stability"),tags$li("AMMI: 3 biplot types, ASV, WAAS index"),tags$li("GGE: 7 biplot types (3 SVP options)")),
-              br(),
-              h4(style="color:#1B4332;","Module 3 — Multi-Trait Selection Suite"),
-              tags$ul(tags$li("MTSI, MGIDI, FAI-BLUP, Smith-Hazel"),tags$li("Direct selection on yield trait"),tags$li("Selection differentials (Table 3)"),tags$li("Coincidence index & 4-way Venn diagram"),tags$li("GT/GYT biplots & Radar chart")),
-              br(),
-              p(strong("Key packages:"),"metan, biotools, FactoMineR, ggplot2, plotly, corrplot, fmsb"),
-              div(class="app-footer","Version 1.0 (Combined Suite) | 2025 | Agriculture University Jodhpur")
-            )
-          )
-        )
+                   div(class="sec-bar","ℹ️ About — Plant Breeding Analytics Suite"),
+                   fluidRow(
+                     column(6,
+                            div(class="dev-card",
+                                div(class="dev-name","Dr. Vijay Kamal Meena"),
+                                div(class="dev-role","Assistant Professor (GPB) | Agriculture University Jodhpur"),
+                                hr(style="border:none;border-top:1px solid rgba(255,255,255,.15);margin:12px 0;"),
+                                div(class="cr",tags$i(class="fa fa-graduation-cap"),"M.Sc. & Ph.D. — ICAR-IARI, New Delhi"),
+                                div(class="cr",tags$i(class="fa fa-award"),         "ICAR-ARS 2021"),
+                                div(class="cr",tags$i(class="fa fa-university"),    "Agri. Research Sub-Station Sumerpur (Pali)"),
+                                div(class="cr",tags$i(class="fa fa-building"),      "Agriculture University Jodhpur"),
+                                div(class="cr",tags$i(class="fa fa-envelope"),      "vjkamal93@gmail.com"),
+                                div(class="cr",tags$i(class="fa fa-envelope"),      "vijaykamal@aujodhpur.ac.in"),
+                                div(class="cr",tags$i(class="fa fa-phone"),         "+91 9449509856"),
+                                div(class="tags",
+                                    span(class="tag","Plant Breeding"),   span(class="tag","Quantitative Genetics"),
+                                    span(class="tag","GxE Interaction"),  span(class="tag","MET Analysis"),
+                                    span(class="tag","AMMI"), span(class="tag","GGE Biplot"), span(class="tag","MTSI"),
+                                    span(class="tag","MGIDI"), span(class="tag","FAI-BLUP"), span(class="tag","D² Analysis"),
+                                    span(class="tag","R Programming"), span(class="tag","Bioinformatics"))
+                            )
+                     ),
+                     column(6,
+                            box(title="About This Suite", width=12, status="success", solidHeader=TRUE,
+                                p("A unified professional Shiny dashboard combining three analytical modules for plant breeding research:"),
+                                br(),
+                                h4(style="color:#1B4332;","Module 1 — D² Genetic Diversity Analyser"),
+                                tags$ul(tags$li("Mahalanobis D² distance matrix"),tags$li("MANOVA & univariate ANOVA"),tags$li("Tocher clustering, dendrogram, network plot"),tags$li("PCA biplot with cluster overlay"),tags$li("Pearson correlation heatmap")),
+                                br(),
+                                h4(style="color:#1B4332;","Module 2 — MET Analysis (AMMI/GGE)"),
+                                tags$ul(tags$li("Descriptive statistics, GxE heatmap"),tags$li("Individual + pooled ANOVA, Bartlett test"),tags$li("ANOVA, regression & non-parametric stability"),tags$li("AMMI: 3 biplot types, ASV, WAAS index"),tags$li("GGE: 7 biplot types (3 SVP options)")),
+                                br(),
+                                h4(style="color:#1B4332;","Module 3 — Multi-Trait Selection Suite"),
+                                tags$ul(tags$li("MTSI, MGIDI, FAI-BLUP, Smith-Hazel"),tags$li("Direct selection on yield trait"),tags$li("Selection differentials (Table 3)"),tags$li("Coincidence index & 4-way Venn diagram"),tags$li("GT/GYT biplots & Radar chart")),
+                                br(),
+                                p(strong("Key packages:"),"metan, biotools, FactoMineR, ggplot2, plotly, corrplot, fmsb"),
+                                div(class="app-footer","Version 1.0 (Combined Suite) | 2025 | Agriculture University Jodhpur")
+                            )
+                     )
+                   )
       ))   # closes tabItem("about",...) + list()
     ))     # closes c(...) + do.call(tabItems, ...)
   )
