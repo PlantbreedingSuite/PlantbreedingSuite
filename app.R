@@ -1297,14 +1297,53 @@ d2Server <- function(id) {
       ci <- active_cluster_info()
       print(d2_build_network(ci$dist_m, ci$n_clust, ci$pal, ci$label))
     })
+    # active_cluster_vec() — derives a genotype-named membership vector
+    # from whichever clustering method is currently selected (Tocher
+    # default, or the Ward/other-linkage cut at the chosen k). This is
+    # the single source used by the Cluster-wise Trait Means table, its
+    # download handler, and the ZIP export — so they all stay in sync
+    # with the Network Distance Plot and the dendrogram.
+    active_cluster_vec <- reactive({
+      req(rv$toc, rv$dm, rv$data2)
+      km <- input$clust_k_method %||% "tocher"
+      if (km == "tocher") {
+        rv$cluster_vec                        # Tocher membership (unchanged)
+      } else {
+        k    <- rv$dendro_k %||% rv$n_clust
+        meth <- rv$hc_method_used %||% "ward.D2"
+        d2_hc_cut_membership(rv$dm, k, meth) # Ward / other-linkage cut
+      }
+    })
+    
     output$cluster_means <- renderDT({
-      req(rv$cluster_vec, rv$data2)
-      d2c <- rv$data2; d2c$Cluster <- rv$cluster_vec[match(as.character(d2c[,1]), names(rv$cluster_vec))]
+      req(rv$data2)
+      cv  <- active_cluster_vec()
+      req(!is.null(cv))
+      d2c <- rv$data2
+      d2c$Cluster <- cv[match(as.character(d2c[,1]), names(cv))]
+      d2c <- d2c[!is.na(d2c$Cluster), ]
       cm  <- aggregate(d2c[,-c(1,ncol(d2c))], by=list(Cluster=d2c$Cluster), mean)
       nc  <- sapply(cm, is.numeric)
-      datatable(cbind(cm[,!nc,drop=FALSE], round(cm[,nc],3)), options=d2_dt_opts, rownames=FALSE, class="display compact")
+      cap_txt <- if ((input$clust_k_method %||% "tocher") == "tocher")
+        "Tocher Clusters" else
+          paste0(rv$hc_method_used %||% "ward.D2", " Clusters (k=", rv$dendro_k %||% rv$n_clust, ")")
+      datatable(cbind(cm[,!nc,drop=FALSE], round(cm[,nc],3)), options=d2_dt_opts, rownames=FALSE,
+                class="display compact",
+                caption=htmltools::tags$caption(
+                  style="caption-side:top;text-align:left;color:#2D6A4F;font-weight:600;",
+                  paste0("Basis: ", cap_txt)))
     })
     output$cluster_means_dl_ui <- renderUI({ req(rv$ran_tocher); downloadButton(session$ns("dl_cluster_means"), "\u2B07  Cluster-wise Trait Means (.csv)", class="btn-warning btn-sm") })
+    output$dl_cluster_means <- downloadHandler("Cluster_Trait_Means.csv", function(f){
+      cv  <- active_cluster_vec()
+      req(!is.null(cv), rv$data2)
+      d2c <- rv$data2
+      d2c$Cluster <- cv[match(as.character(d2c[,1]), names(cv))]
+      d2c <- d2c[!is.na(d2c$Cluster), ]
+      cm  <- aggregate(d2c[,-c(1,ncol(d2c))], by=list(Cluster=d2c$Cluster), mean)
+      nc  <- sapply(cm, is.numeric); cm[nc] <- round(cm[nc], 4)
+      write.csv(cm[order(cm$Cluster),], f, row.names=FALSE)
+    })
     
     observeEvent(input$btn_pca, {
       req(rv$data2)
@@ -1524,8 +1563,12 @@ d2Server <- function(id) {
         }
         if (isTRUE(rv$ran_tocher)) {
           ci <- active_cluster_info()
+          cv <- active_cluster_vec()
           items$tocher <- list(filename="Tocher_Clusters.csv", write=function(p){ df<-data.frame(Genotype=names(rv$cluster_vec),Cluster=rv$cluster_vec); write.csv(df[order(df$Cluster),],p,row.names=FALSE) })
-          items$cmeans <- list(filename="Cluster_Trait_Means.csv", write=function(p){ d2c<-rv$data2; d2c$Cluster<-rv$cluster_vec[match(as.character(d2c[,1]),names(rv$cluster_vec))]; cm<-aggregate(d2c[,-c(1,ncol(d2c))],by=list(Cluster=d2c$Cluster),mean); nc<-sapply(cm,is.numeric); cm[nc]<-round(cm[nc],4); write.csv(cm[order(cm$Cluster),],p,row.names=FALSE) })
+          items$cmeans <- list(filename="Cluster_Trait_Means.csv", write=function(p){
+            d2c<-rv$data2; d2c$Cluster<-cv[match(as.character(d2c[,1]),names(cv))]; d2c<-d2c[!is.na(d2c$Cluster),]
+            cm<-aggregate(d2c[,-c(1,ncol(d2c))],by=list(Cluster=d2c$Cluster),mean); nc<-sapply(cm,is.numeric); cm[nc]<-round(cm[nc],4)
+            write.csv(cm[order(cm$Cluster),],p,row.names=FALSE) })
           items$cdist  <- list(filename="Cluster_Distances.csv", write=function(p){ dm<-as.data.frame(round(ci$dist_m,4)); rownames(dm)<-colnames(dm)<-paste0("C",seq_len(nrow(dm))); write.csv(dm,p) })
           k<-rv$dendro_k %||% rv$n_clust; pal<-rv$dendro_pal %||% rv$pal; meth<-rv$hc_method_used %||% "ward.D2"
           items$dendro <- list(filename="Dendrogram.pdf", write=function(p){ cairo_pdf(p,14,8); d2_draw_dendro(rv$dm,k,pal,meth); dev.off() })
@@ -2222,10 +2265,13 @@ selection_differential <- function(blup_mat, selected_geno, goals, method_nm) {
     tibble(Method=method_nm,Trait=tr,Goal=as_goal_words(goals[[tr]]),OverallMean=xo,SelectedMean=xs,SD=gn,SDpercent=gn/abs(xo)*100,DesiredGain=ifelse((goals[[tr]]=="h"&gn>0)|(goals[[tr]]=="l"&gn<0),"Yes","No"))
   }))
 }
-make_sh_index <- function(blup_mat, raw_data, traits, goals, si) {
+make_sh_index <- function(blup_mat, raw_data, traits, goals, si, econ_weights=NULL) {
   pm <- raw_data %>% group_by(GEN) %>% summarise(across(all_of(traits),~mean(.x,na.rm=TRUE)),.groups="drop")
   pcov <- pm%>%select(-GEN)%>%as.matrix()%>%cov(); gcov <- blup_mat%>%select(-GEN)%>%as.matrix()%>%cov()
-  weights <- ifelse(goals=="l",-1,1)
+  sign_w <- ifelse(goals=="l",-1,1)
+  if(is.null(econ_weights)) econ_weights <- setNames(rep(1,length(goals)),names(goals))
+  econ_weights <- as.numeric(econ_weights[names(goals)])
+  weights <- sign_w * econ_weights
   Smith_Hazel(blup_mat%>%column_to_rownames("GEN")%>%as.matrix(),pcov=pcov,gcov=gcov,weights=weights,SI=si)
 }
 selection_overlap_table <- function(selected_list, total_n) {
@@ -2450,12 +2496,17 @@ mtUI <- function(id) {
             div(class="sec-bar","⚖️ MT — Smith-Hazel"),
             fluidRow(
               box(title="Options",width=3,status="success",solidHeader=TRUE,
+                  h5(style="color:#1B4332;margin:4px 0 7px;","Economic Weights:"),
+                  p(style="color:#777;font-size:11px;margin:0 0 8px;","Set the relative economic importance of each trait (as in metan::Smith_Hazel). Default = 1 for all traits; direction (higher/lower is better) is applied automatically from the Trait Goals set on the Data tab."),
+                  uiOutput(ns("ui_sh_weights")),
+                  actionButton(ns("btn_sh_reset_w"),"↺  Reset Weights to 1",class="btn-default btn-block",style="font-size:11px;margin-bottom:8px;"),
+                  hr(),
                   actionButton(ns("btn_sh"),"▶  Run Smith-Hazel",class="btn-success btn-block",icon=icon("play")), hr(),
                   downloadButton(ns("dl_sh_idx"),"⬇  SH Index",class="btn-warning btn-block")
               ),
               box(title="Smith-Hazel Results",width=9,status="success",solidHeader=TRUE,
                   tabsetPanel(
-                    tabPanel("📋 Index",      br(), DTOutput(ns("tbl_sh"))),
+                    tabPanel("📋 Index",      br(), uiOutput(ns("ui_sh_weights_used")), DTOutput(ns("tbl_sh"))),
                     tabPanel("📋 Selected",   br(), verbatimTextOutput(ns("txt_sh_sel"))),
                     tabPanel("📊 Circular",   dl_bar(ns("dl_plt_sh_circ")), plotOutput(ns("plt_sh_circ"),height="500px")),
                     tabPanel("📊 metan Default", dl_bar(ns("dl_plt_sh_def")), plotOutput(ns("plt_sh_def"),height="400px"))
@@ -2636,6 +2687,23 @@ mtServer <- function(id) {
       goals[!sapply(goals,is.null)]
     })
     selected_traits_r <- reactive({ req(numeric_trait_cols()); numeric_trait_cols() })
+    output$ui_sh_weights <- renderUI({
+      req(selected_traits_r()); trs <- selected_traits_r()
+      tagList(div(class="goal-grid",lapply(trs,function(tr){
+        div(class="goal-row",span(class="trait-name",tr),
+            numericInput(session$ns(paste0("shw_",tr)),NULL,value=1,min=0,step=0.1,width="90px"))
+      })))
+    })
+    observeEvent(input$btn_sh_reset_w, {
+      req(selected_traits_r())
+      for(tr in selected_traits_r()) updateNumericInput(session,paste0("shw_",tr),value=1)
+    })
+    sh_weights_r <- reactive({
+      req(selected_traits_r()); trs <- selected_traits_r()
+      w <- sapply(trs,function(tr) input[[paste0("shw_",tr)]]%||%1)
+      w <- suppressWarnings(as.numeric(w)); w[is.na(w)] <- 1
+      setNames(w,trs)
+    })
     observeEvent(input$btn_load, {
       mt_valmsg(NULL); processed_data(NULL)
       req(raw_data(),input$env_col,input$gen_col,input$rep_col)
@@ -2771,7 +2839,14 @@ mtServer <- function(id) {
     output$dl_plt_fai_def  <- downloadHandler(paste0("FAIBLUP_default_",Sys.Date(),".pdf"), function(f){ req(fai_r()); cairo_pdf(f,16,10); tryCatch({ p<-plot(fai_r()); print(p) },error=function(e){plot.new();title(e$message)}); dev.off() })
     output$dl_fai_idx      <- downloadHandler(paste0("FAIBLUP_index_",Sys.Date(),".xlsx"), function(f){ req(fai_tbl_r()); write_xlsx(as.data.frame(fai_tbl_r()),f) })
     
-    sh_r <- eventReactive(input$btn_sh, { req(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r()); tryCatch(make_sh_index(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r(),input$sel_intensity),error=function(e){ showNotification(paste("Smith-Hazel error:",e$message),type="error");NULL }) })
+    sh_r <- eventReactive(input$btn_sh, { req(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r()); tryCatch(make_sh_index(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r(),input$sel_intensity,sh_weights_r()),error=function(e){ showNotification(paste("Smith-Hazel error:",e$message),type="error");NULL }) })
+    sh_weights_used_r <- eventReactive(input$btn_sh, { sh_weights_r() })
+    output$ui_sh_weights_used <- renderUI({
+      req(sh_r(),sh_weights_used_r()); w <- sh_weights_used_r()
+      p(style="color:#555;font-size:12px;margin:0 0 8px;",
+        strong("Economic weights used: "),
+        paste(names(w),"=",format(w,digits=3),collapse="  |  "))
+    })
     output$tbl_sh     <- renderDT({ req(sh_r()); fmt_dt(tryCatch(safe_df(sh_r()$index),error=function(e)data.frame(Error=e$message))) })
     output$txt_sh_sel <- renderPrint({ req(sh_r()); cat("Selected genotypes:\n"); print(tryCatch(as.character(sh_r()$sel_gen),error=function(e)"Error extracting")) })
     r_plt_sh_circ <- reactive({ req(sh_r()); df<-tryCatch(as.data.frame(sh_r()$index),error=function(e)NULL); req(df); gc<-if("GEN" %in% names(df))"GEN" else names(df)[1]; vc<-grep("^V1$|index|Score|value",names(df),value=TRUE,ignore.case=TRUE)[1]%||%names(df)[which(sapply(df,is.numeric))[1]]; sel<-tryCatch(as.character(sh_r()$sel_gen),error=function(e)character(0)); make_circular_index_plot(df,gc,vc,sel,"Smith-Hazel — Circular Index Plot","Individual Genetic Worth",lower_is_better=FALSE) })
@@ -2934,83 +3009,250 @@ mtServer <- function(id) {
 #  COMBINED UI
 # ════════════════════════════════════════════════════════════════
 ui <- dashboardPage(
-  skin = "green", title = "Plant Breeding Analytics Suite",
+  skin = "green", title = "PlantBreedingSuite",
   
+  # ── Header ──────────────────────────────────────────────
   dashboardHeader(
-    title = div(
-      div(style="font-family:'Playfair Display',serif;font-size:14px;color:#95D5B2;line-height:1.2;","🌾 Plant Breeding Suite"),
-      div(style="font-size:9.5px;color:#74C69D;letter-spacing:.8px;font-weight:600;","D² · MET · MULTI-TRAIT")
-    ), titleWidth = 230
+    title = tags$div(
+      style = "display:flex;align-items:center;gap:10px;",
+      tags$div(
+        style = "width:32px;height:32px;background:linear-gradient(135deg,#2D6A4F,#52B788);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;box-shadow:0 0 10px rgba(82,183,136,.6);",
+        "🌾"
+      ),
+      tags$div(
+        tags$div(style="font-family:'Playfair Display',serif;font-size:13px;color:#95D5B2;line-height:1.15;", "PlantBreedingSuite"),
+        tags$div(style="font-size:8.5px;color:#52B788;letter-spacing:1.5px;font-weight:700;", "D² · MET · MULTI-TRAIT")
+      )
+    ),
+    titleWidth = 220,
+    # Right-side author info in header
+    tags$li(class="dropdown",
+            style="display:flex;align-items:center;padding:0 14px;",
+            tags$span(
+              style="font-size:10px;color:#74C69D;line-height:1.4;text-align:right;",
+              tags$strong(style="color:#95D5B2;display:block;", "Dr. Vijay Kamal Meena"),
+              "Asst. Prof. (GPB) · AU Jodhpur · ICAR-ARS 2021"
+            )
+    )
   ),
   
-  dashboardSidebar(width = 230,
+  # ── Sidebar (kept for Shiny binding; hidden visually) ───
+  dashboardSidebar(width = 220,
+                   tags$style(".main-sidebar,.left-side{display:none!important;}
+                .content-wrapper,.right-side{margin-left:0!important;}"),
                    sidebarMenu(id = "main_menu",
-                               # ── D² Analysis ──────────────────────────────────────
                                tags$li(class="suite-divider", "🌿 D² Genetic Diversity"),
-                               menuItem("📁  Data Upload",    tabName="d2_upload",  icon=icon("upload")),
-                               menuItem("🧮  Genotypic Values", tabName="d2_genoval", icon=icon("calculator")),
-                               menuItem("📊  MANOVA",         tabName="d2_manova",  icon=icon("chart-bar")),
-                               menuItem("📐  D² Distances",   tabName="d2_d2",      icon=icon("ruler-combined")),
-                               menuItem("🌐  Tocher Cluster", tabName="d2_tocher",  icon=icon("project-diagram")),
-                               menuItem("📈  PCA",            tabName="d2_pca",     icon=icon("dot-circle")),
-                               menuItem("🔗  Correlation",    tabName="d2_corr",    icon=icon("link")),
-                               menuItem("📦  D² Export",      tabName="d2_export",  icon=icon("download")),
-                               # ── MET Analysis ─────────────────────────────────────
+                               menuItem("Data Upload",      tabName="d2_upload",  icon=icon("upload")),
+                               menuItem("Genotypic Values", tabName="d2_genoval", icon=icon("calculator")),
+                               menuItem("MANOVA",           tabName="d2_manova",  icon=icon("chart-bar")),
+                               menuItem("D² Distances",     tabName="d2_d2",      icon=icon("ruler-combined")),
+                               menuItem("Tocher Cluster",   tabName="d2_tocher",  icon=icon("project-diagram")),
+                               menuItem("PCA",              tabName="d2_pca",     icon=icon("dot-circle")),
+                               menuItem("Correlation",      tabName="d2_corr",    icon=icon("link")),
+                               menuItem("D² Export",        tabName="d2_export",  icon=icon("download")),
                                tags$li(class="suite-divider", "🌾 MET Analysis"),
-                               menuItem("🏠  MET Home",        tabName="met_home",       icon=icon("home")),
-                               menuItem("📂  MET Data",        tabName="met_data",       icon=icon("database")),
-                               menuItem("📊  Descriptive",     tabName="met_desc",       icon=icon("chart-bar")),
-                               menuItem("📈  Mean Performance",tabName="met_mean",       icon=icon("line-chart")),
-                               menuItem("🔬  ANOVA",           tabName="met_anova",      icon=icon("flask")),
-                               menuItem("📉  Stability",       tabName="met_stab_anova", icon=icon("balance-scale"),
-                                        menuSubItem("ANOVA-based",      tabName="met_stab_anova"),
-                                        menuSubItem("Regression",       tabName="met_stab_reg"),
-                                        menuSubItem("Non-parametric",   tabName="met_stab_np"),
-                                        menuSubItem("Factor Analysis",  tabName="met_stab_fa"),
-                                        menuSubItem("Wrap Parameters",  tabName="met_stab_wrap")
+                               menuItem("MET Home",         tabName="met_home",       icon=icon("home")),
+                               menuItem("MET Data",         tabName="met_data",       icon=icon("database")),
+                               menuItem("Descriptive",      tabName="met_desc",       icon=icon("chart-bar")),
+                               menuItem("Mean Performance", tabName="met_mean",       icon=icon("line-chart")),
+                               menuItem("ANOVA",            tabName="met_anova",      icon=icon("flask")),
+                               menuItem("Stability",        tabName="met_stab_anova", icon=icon("balance-scale"),
+                                        menuSubItem("ANOVA-based",     tabName="met_stab_anova"),
+                                        menuSubItem("Regression",      tabName="met_stab_reg"),
+                                        menuSubItem("Non-parametric",  tabName="met_stab_np"),
+                                        menuSubItem("Factor Analysis", tabName="met_stab_fa"),
+                                        menuSubItem("Wrap Parameters", tabName="met_stab_wrap")
                                ),
-                               menuItem("🎯  AMMI",            tabName="met_ammi",  icon=icon("bullseye")),
-                               menuItem("🌐  GGE",             tabName="met_gge",   icon=icon("globe")),
-                               menuItem("📦  Export",          tabName="met_export",icon=icon("download")),
-                               # ── Multi-Trait ───────────────────────────────────────
+                               menuItem("AMMI",             tabName="met_ammi",   icon=icon("bullseye")),
+                               menuItem("GGE",              tabName="met_gge",    icon=icon("globe")),
+                               menuItem("MET Export",       tabName="met_export", icon=icon("download")),
                                tags$li(class="suite-divider", "🧬 Multi-Trait Selection"),
-                               menuItem("🏠  MT Home",         tabName="mt_home",       icon=icon("home")),
-                               menuItem("📂  Data & Settings", tabName="mt_data",       icon=icon("cog")),
-                               menuItem("⚙️  Fit Models",      tabName="mt_fit",        icon=icon("cogs")),
-                               menuItem("📊  Variance Comp.",  tabName="mt_varcomp",    icon=icon("table")),
-                               menuItem("🎯  MTSI",            tabName="mt_mtsi",       icon=icon("bullseye")),
-                               menuItem("🧬  MGIDI",           tabName="mt_mgidi",      icon=icon("dna")),
-                               menuItem("🔢  FAI-BLUP",        tabName="mt_fai",        icon=icon("calculator")),
-                               menuItem("⚖️  Smith-Hazel",     tabName="mt_sh",         icon=icon("balance-scale")),
-                               menuItem("📈  Direct Select.",  tabName="mt_direct",     icon=icon("arrow-up")),
-                               menuItem("🔗  Selection Summary", tabName="mt_table3",  icon=icon("list-check"),
+                               menuItem("MT Home",          tabName="mt_home",    icon=icon("home")),
+                               menuItem("Data & Settings",  tabName="mt_data",    icon=icon("cog")),
+                               menuItem("Fit Models",       tabName="mt_fit",     icon=icon("cogs")),
+                               menuItem("Variance Comp.",   tabName="mt_varcomp", icon=icon("table")),
+                               menuItem("MTSI",             tabName="mt_mtsi",    icon=icon("bullseye")),
+                               menuItem("MGIDI",            tabName="mt_mgidi",   icon=icon("dna")),
+                               menuItem("FAI-BLUP",         tabName="mt_fai",     icon=icon("calculator")),
+                               menuItem("Smith-Hazel",      tabName="mt_sh",      icon=icon("balance-scale")),
+                               menuItem("Direct Select.",   tabName="mt_direct",  icon=icon("arrow-up")),
+                               menuItem("Selection Summary",tabName="mt_table3",  icon=icon("list-check"),
                                         menuSubItem("Selection Diff. (Table 3)", tabName="mt_table3"),
                                         menuSubItem("Coincidence Index",         tabName="mt_coincidence"),
                                         menuSubItem("Membership & Venn",         tabName="mt_venn")
                                ),
-                               menuItem("📉  GT/GYT Biplots",  tabName="mt_biplots",    icon=icon("chart-line")),
-                               menuItem("🌟  Radar Chart",     tabName="mt_radar",      icon=icon("star")),
-                               menuItem("💾  MT Export",       tabName="mt_export",     icon=icon("download")),
-                               # ── About ─────────────────────────────────────────────
+                               menuItem("GT/GYT Biplots",   tabName="mt_biplots", icon=icon("chart-line")),
+                               menuItem("Radar Chart",      tabName="mt_radar",   icon=icon("star")),
+                               menuItem("MT Export",        tabName="mt_export",  icon=icon("download")),
                                tags$li(class="suite-divider", "ℹ️ Information"),
-                               menuItem("ℹ️  About",           tabName="about",     icon=icon("info-circle"))
-                   ),
-                   div(style="position:absolute;bottom:0;width:100%;padding:8px 12px;background:rgba(0,0,0,.3);font-size:9.5px;color:#52B788;border-top:1px solid rgba(82,183,136,.2);line-height:1.6;",
-                       "Dr. V.K. Meena | AU Jodhpur")
+                               menuItem("About",            tabName="about",      icon=icon("info-circle"))
+                   )
   ),
   
+  # ── Body ────────────────────────────────────────────────
   dashboardBody(
     APP_CSS,
+    
+    # ── Extra CSS for the horizontal shell ────────────────
+    tags$style(HTML("
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@700&display=swap');
+body,.content-wrapper,.right-side{font-family:'Inter',sans-serif!important;background:#f0f4f1!important;}
+.skin-green .main-header .navbar{background:linear-gradient(90deg,#061208,#0d2818 45%,#163824)!important;border-bottom:1px solid rgba(82,183,136,.3)!important;}
+.skin-green .main-header .logo{background:linear-gradient(135deg,#061208,#1B4332)!important;border-bottom:1px solid rgba(82,183,136,.3)!important;}
+.main-header{box-shadow:0 2px 18px rgba(0,0,0,.5)!important;}
+
+/* ── Horizontal module navbar ───────────────────────── */
+#pbs-modnav{
+  background:linear-gradient(90deg,#0a1f12,#102a1a 50%,#163524);
+  border-bottom:1px solid rgba(82,183,136,.2);
+  padding:0 20px;
+  display:flex;align-items:center;gap:5px;
+  height:46px;overflow-x:auto;flex-wrap:nowrap;
+  box-shadow:0 2px 10px rgba(0,0,0,.3);
+}
+#pbs-modnav::-webkit-scrollbar{height:2px;}
+#pbs-modnav::-webkit-scrollbar-thumb{background:#52B788;}
+.mod-pill{
+  display:inline-flex;align-items:center;gap:7px;padding:6px 18px;
+  border-radius:22px;font-size:11.5px;font-weight:700;letter-spacing:.5px;
+  cursor:pointer;color:#74C69D;background:transparent;
+  border:1.5px solid transparent;transition:all .2s ease;
+  white-space:nowrap;text-transform:uppercase;user-select:none;
+}
+.mod-pill:hover{background:rgba(82,183,136,.15);border-color:rgba(82,183,136,.35);color:#B7E4C7;}
+.mod-pill.mp-active{
+  background:linear-gradient(135deg,#2D6A4F,#40916C)!important;
+  border-color:transparent!important;color:#fff!important;
+  box-shadow:0 3px 12px rgba(45,106,79,.55)!important;
+}
+.mod-pill .mp-badge{
+  background:rgba(255,255,255,.2);border-radius:9px;
+  font-size:9px;padding:1px 6px;font-weight:700;
+}
+.mod-pill .mp-icon{font-size:14px;}
+
+/* ── Horizontal subnav ribbon ────────────────────────── */
+#pbs-subnav{
+  background:rgba(10,31,18,.75);
+  backdrop-filter:blur(6px);
+  border-bottom:1px solid rgba(82,183,136,.12);
+  padding:0 20px;
+  display:flex;align-items:center;gap:2px;
+  min-height:38px;overflow-x:auto;flex-wrap:nowrap;
+}
+#pbs-subnav::-webkit-scrollbar{height:2px;}
+#pbs-subnav::-webkit-scrollbar-thumb{background:#40916C;}
+.snav-btn{
+  display:inline-flex;align-items:center;gap:5px;padding:5px 12px;
+  border-radius:5px;font-size:11px;font-weight:600;cursor:pointer;
+  color:#74C69D;background:transparent;border:none;
+  transition:all .17s;white-space:nowrap;text-decoration:none;
+}
+.snav-btn:hover{background:rgba(82,183,136,.18);color:#D8F3DC;}
+.snav-btn.sn-active{
+  background:rgba(82,183,136,.3);color:#fff;
+  box-shadow:inset 0 -2px 0 #52B788;
+}
+.snav-sep{width:1px;height:18px;background:rgba(82,183,136,.22);margin:0 3px;flex-shrink:0;}
+.snav-group{display:none;contents:unset;}
+.snav-group.sg-active{display:contents;}
+
+/* ── Content area ─────────────────────────────────────── */
+.content-wrapper{padding-top:0!important;}
+.content{padding:16px 20px!important;}
+
+/* ── Footer ──────────────────────────────────────────── */
+#pbs-footer{
+  background:linear-gradient(90deg,#071F14,#0d2818,#163824);
+  border-top:1px solid rgba(82,183,136,.2);
+  padding:7px 22px;display:flex;align-items:center;
+  justify-content:space-between;font-size:10px;color:#52B788;
+  margin-top:10px;border-radius:0 0 8px 8px;
+}
+#pbs-footer b{color:#95D5B2;}
+    ")),
+    
+    # ── Module nav pills ──────────────────────────────────
+    div(id="pbs-modnav",
+        div(class="mod-pill mp-active", `data-mod`="d2",
+            span(class="mp-icon","🌿"), span("D² Diversity"), span(class="mp-badge","M1")),
+        div(class="mod-pill", `data-mod`="met",
+            span(class="mp-icon","🌾"), span("MET Analysis"), span(class="mp-badge","M2")),
+        div(class="mod-pill", `data-mod`="mt",
+            span(class="mp-icon","🧬"), span("Multi-Trait"), span(class="mp-badge","M3")),
+        div(class="mod-pill", `data-mod`="about",
+            span(class="mp-icon","ℹ️"), span("About"))
+    ),
+    
+    # ── Subnav ribbons ────────────────────────────────────
+    div(id="pbs-subnav",
+        # D²
+        tags$div(class="snav-group sg-active", `data-mod`="d2",
+                 tags$button(class="snav-btn sn-active", `data-tab`="d2_upload",  "📁 Upload"),
+                 tags$button(class="snav-btn", `data-tab`="d2_genoval",            "🧮 Genotypic Values"),
+                 div(class="snav-sep"),
+                 tags$button(class="snav-btn", `data-tab`="d2_manova",             "📊 MANOVA"),
+                 tags$button(class="snav-btn", `data-tab`="d2_d2",                 "📐 D² Distances"),
+                 tags$button(class="snav-btn", `data-tab`="d2_tocher",             "🌐 Clustering"),
+                 tags$button(class="snav-btn", `data-tab`="d2_pca",                "📈 PCA"),
+                 tags$button(class="snav-btn", `data-tab`="d2_corr",               "🔗 Correlation"),
+                 div(class="snav-sep"),
+                 tags$button(class="snav-btn", `data-tab`="d2_export",             "📦 Export")
+        ),
+        # MET
+        tags$div(class="snav-group", `data-mod`="met",
+                 tags$button(class="snav-btn", `data-tab`="met_home",              "🏠 Home"),
+                 tags$button(class="snav-btn", `data-tab`="met_data",              "📂 Data"),
+                 tags$button(class="snav-btn", `data-tab`="met_desc",              "📊 Descriptive"),
+                 tags$button(class="snav-btn", `data-tab`="met_mean",              "📈 Means"),
+                 tags$button(class="snav-btn", `data-tab`="met_anova",             "🔬 ANOVA"),
+                 div(class="snav-sep"),
+                 tags$button(class="snav-btn", `data-tab`="met_stab_anova",        "📉 Stab·ANOVA"),
+                 tags$button(class="snav-btn", `data-tab`="met_stab_reg",          "📉 Stab·Reg"),
+                 tags$button(class="snav-btn", `data-tab`="met_stab_np",           "📉 Stab·NP"),
+                 tags$button(class="snav-btn", `data-tab`="met_stab_fa",           "📉 Stab·FA"),
+                 tags$button(class="snav-btn", `data-tab`="met_stab_wrap",         "📉 Wrap"),
+                 div(class="snav-sep"),
+                 tags$button(class="snav-btn", `data-tab`="met_ammi",              "🎯 AMMI"),
+                 tags$button(class="snav-btn", `data-tab`="met_gge",               "🌐 GGE"),
+                 div(class="snav-sep"),
+                 tags$button(class="snav-btn", `data-tab`="met_export",            "📦 Export")
+        ),
+        # MT
+        tags$div(class="snav-group", `data-mod`="mt",
+                 tags$button(class="snav-btn", `data-tab`="mt_home",               "🏠 Home"),
+                 tags$button(class="snav-btn", `data-tab`="mt_data",               "📂 Data"),
+                 tags$button(class="snav-btn", `data-tab`="mt_fit",                "⚙️ Fit Models"),
+                 tags$button(class="snav-btn", `data-tab`="mt_varcomp",            "📊 Var. Comp."),
+                 div(class="snav-sep"),
+                 tags$button(class="snav-btn", `data-tab`="mt_mtsi",               "🎯 MTSI"),
+                 tags$button(class="snav-btn", `data-tab`="mt_mgidi",              "🧬 MGIDI"),
+                 tags$button(class="snav-btn", `data-tab`="mt_fai",                "🔢 FAI-BLUP"),
+                 tags$button(class="snav-btn", `data-tab`="mt_sh",                 "⚖️ Smith-Hazel"),
+                 tags$button(class="snav-btn", `data-tab`="mt_direct",             "📈 Direct Sel."),
+                 div(class="snav-sep"),
+                 tags$button(class="snav-btn", `data-tab`="mt_table3",             "🔗 Sel. Diff."),
+                 tags$button(class="snav-btn", `data-tab`="mt_coincidence",        "🔗 Coincidence"),
+                 tags$button(class="snav-btn", `data-tab`="mt_venn",               "🔗 Venn"),
+                 div(class="snav-sep"),
+                 tags$button(class="snav-btn", `data-tab`="mt_biplots",            "📉 GT/GYT"),
+                 tags$button(class="snav-btn", `data-tab`="mt_radar",              "🌟 Radar"),
+                 div(class="snav-sep"),
+                 tags$button(class="snav-btn", `data-tab`="mt_export",             "💾 Export")
+        ),
+        # About
+        tags$div(class="snav-group", `data-mod`="about",
+                 tags$button(class="snav-btn", `data-tab`="about",                 "ℹ️ About & Credits")
+        )
+    ),
+    
+    # ── Actual shinydashboard tab content (unchanged) ─────
     do.call(tabItems, c(
-      # ── D² tabs ────────────────────────────────────────
       as.list(d2UI("d2")),
-      # ── MET tabs ───────────────────────────────────────
       as.list(metUI("met")),
-      # ── MT tabs ────────────────────────────────────────
       as.list(mtUI("mt")),
-      # ── About tab ──────────────────────────────────────
       list(tabItem("about",
-                   div(class="sec-bar","ℹ️ About — Plant Breeding Analytics Suite"),
+                   div(class="sec-bar","ℹ️ About — PlantBreedingSuite"),
                    fluidRow(
                      column(6,
                             div(class="dev-card",
@@ -3025,33 +3267,88 @@ ui <- dashboardPage(
                                 div(class="cr",tags$i(class="fa fa-envelope"),      "vijaykamal@aujodhpur.ac.in"),
                                 div(class="cr",tags$i(class="fa fa-phone"),         "+91 9449509856"),
                                 div(class="tags",
-                                    span(class="tag","Plant Breeding"),   span(class="tag","Quantitative Genetics"),
-                                    span(class="tag","GxE Interaction"),  span(class="tag","MET Analysis"),
+                                    span(class="tag","Plant Breeding"), span(class="tag","Quantitative Genetics"),
+                                    span(class="tag","GxE Interaction"), span(class="tag","MET Analysis"),
                                     span(class="tag","AMMI"), span(class="tag","GGE Biplot"), span(class="tag","MTSI"),
-                                    span(class="tag","MGIDI"), span(class="tag","FAI-BLUP"), span(class="tag","D² Analysis"),
+                                    span(class="tag","MGIDI"), span(class="tag","FAI-BLUP"), span(class="tag","D\u00B2 Analysis"),
                                     span(class="tag","R Programming"), span(class="tag","Bioinformatics"))
                             )
                      ),
                      column(6,
                             box(title="About This Suite", width=12, status="success", solidHeader=TRUE,
-                                p("A unified professional Shiny dashboard combining three analytical modules for plant breeding research:"),
-                                br(),
-                                h4(style="color:#1B4332;","Module 1 — D² Genetic Diversity Analyser"),
-                                tags$ul(tags$li("Mahalanobis D² distance matrix"),tags$li("MANOVA & univariate ANOVA"),tags$li("Tocher clustering, dendrogram, network plot"),tags$li("PCA biplot with cluster overlay"),tags$li("Pearson correlation heatmap")),
-                                br(),
+                                p("A unified professional Shiny dashboard combining three analytical modules for plant breeding research:"), br(),
+                                h4(style="color:#1B4332;","Module 1 — D\u00B2 Genetic Diversity Analyser"),
+                                tags$ul(tags$li("Mahalanobis D\u00B2 distance matrix"),tags$li("MANOVA & univariate ANOVA"),tags$li("Tocher clustering, dendrogram, network plot"),tags$li("PCA biplot with cluster overlay"),tags$li("Pearson correlation heatmap")), br(),
                                 h4(style="color:#1B4332;","Module 2 — MET Analysis (AMMI/GGE)"),
-                                tags$ul(tags$li("Descriptive statistics, GxE heatmap"),tags$li("Individual + pooled ANOVA, Bartlett test"),tags$li("ANOVA, regression & non-parametric stability"),tags$li("AMMI: 3 biplot types, ASV, WAAS index"),tags$li("GGE: 7 biplot types (3 SVP options)")),
-                                br(),
+                                tags$ul(tags$li("Descriptive statistics, GxE heatmap"),tags$li("Individual + pooled ANOVA, Bartlett test"),tags$li("ANOVA, regression & non-parametric stability"),tags$li("AMMI: 3 biplot types, ASV, WAAS index"),tags$li("GGE: 7 biplot types (3 SVP options)")), br(),
                                 h4(style="color:#1B4332;","Module 3 — Multi-Trait Selection Suite"),
-                                tags$ul(tags$li("MTSI, MGIDI, FAI-BLUP, Smith-Hazel"),tags$li("Direct selection on yield trait"),tags$li("Selection differentials (Table 3)"),tags$li("Coincidence index & 4-way Venn diagram"),tags$li("GT/GYT biplots & Radar chart")),
-                                br(),
+                                tags$ul(tags$li("MTSI, MGIDI, FAI-BLUP, Smith-Hazel"),tags$li("Direct selection on yield trait"),tags$li("Selection differentials (Table 3)"),tags$li("Coincidence index & 4-way Venn diagram"),tags$li("GT/GYT biplots & Radar chart")), br(),
                                 p(strong("Key packages:"),"metan, biotools, FactoMineR, ggplot2, plotly, corrplot, fmsb"),
-                                div(class="app-footer","Version 1.0 (Combined Suite) | 2025 | Agriculture University Jodhpur")
+                                div(class="app-footer","Version 2.0 | 2025 | Agriculture University Jodhpur")
                             )
                      )
                    )
-      ))   # closes tabItem("about",...) + list()
-    ))     # closes c(...) + do.call(tabItems, ...)
+      ))
+    )),
+    
+    div(id="pbs-footer",
+        tags$span(tags$b("PlantBreedingSuite"), " · Agriculture University Jodhpur · India"),
+        tags$span("D\u00B2 · MET · Multi-Trait Selection · 2025")
+    ),
+    
+    # ── JS: horizontal nav drives the hidden sidebar ──────
+    # shinydashboard switches tabs by simulating a click on
+    # the sidebar <a> element whose data-value matches the
+    # tab name. We intercept clicks on our nav buttons and
+    # forward them to those hidden sidebar links.
+    tags$script(HTML("
+$(document).ready(function() {
+
+  // ── click a sidebar link by its tabName ──────────────
+  function goTab(tab) {
+    var $link = $('.sidebar-menu a[data-value=\"' + tab + '\"]');
+    if ($link.length) {
+      $link[0].click();
+    } else {
+      // fallback for sub-items registered differently
+      $('a[data-value=\"' + tab + '\"]').first().trigger('click');
+    }
+    // update subnav active state
+    $('.snav-btn').removeClass('sn-active');
+    $('.snav-btn[data-tab=\"' + tab + '\"]').addClass('sn-active');
+  }
+
+  // ── module pill click ─────────────────────────────────
+  $(document).on('click', '.mod-pill', function() {
+    var mod = $(this).data('mod');
+    $('.mod-pill').removeClass('mp-active');
+    $(this).addClass('mp-active');
+    // show correct subnav group
+    $('.snav-group').removeClass('sg-active');
+    $('.snav-group[data-mod=\"' + mod + '\"]').addClass('sg-active');
+    // click the first subnav button of that group
+    var firstBtn = $('.snav-group[data-mod=\"' + mod + '\"] .snav-btn').first();
+    if (firstBtn.length) goTab(firstBtn.data('tab'));
+  });
+
+  // ── subnav button click ───────────────────────────────
+  $(document).on('click', '.snav-btn', function() {
+    goTab($(this).data('tab'));
+  });
+
+  // ── also sync nav when Shiny itself changes the tab ──
+  $(document).on('shiny:value', function() {
+    var active = $('.tab-pane.active').data('value');
+    if (active) {
+      $('.snav-btn').removeClass('sn-active');
+      $('.snav-btn[data-tab=\"' + active + '\"]').addClass('sn-active');
+    }
+  });
+
+  // initial activation
+  goTab('d2_upload');
+});
+    "))
   )
 )
 
