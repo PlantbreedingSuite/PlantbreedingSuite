@@ -233,7 +233,7 @@ This project is licensed under the **MIT License** — see [LICENSE](LICENSE) fo
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 Contributions, bug reports, and feature requests are welcome!  
 Please open an [issue](../../issues) or submit a pull request.
