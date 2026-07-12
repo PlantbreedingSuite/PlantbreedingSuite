@@ -190,10 +190,7 @@ PlantBreedingSuite/
 If you use this application or the data in your research, please cite:
 
 ```
-Meena, V.K. (2025). Plant Breeding Analytics Suite: A unified R Shiny dashboard
-for D² diversity analysis, multi-environment trial stability, and multi-trait
-selection indices. Agriculture University Jodhpur.
-GitHub: https://github.com/vjkamal93/PlantBreedingSuite
+Meena, V. K. (2026). PlantBreedingSuite: An integrated open-source R Shiny dashboard for genetic diversity analysis, multi-environment trial stability, and multi-trait selection in crop breeding programmes. SoftwareX, 35, 102878. https://doi.org/10.1016/j.softx.2026.102878 
 ```
 
 ### Key Packages to Cite
@@ -216,7 +213,7 @@ Agriculture University Jodhpur, Rajasthan, India
 | 🏛️ | Agriculture University Jodhpur |
 | 📧 | vjkamal93@gmail.com |
 | 📧 | vijaykamal@aujodhpur.ac.in |
-| 📞 | +91 9449509856 |
+
 
 ---
 
