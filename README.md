@@ -1,4 +1,4 @@
-# 🌿 Plant Breeding Analytics Suite
+#Plant Breeding Analytics Suite
 
 [![R](https://img.shields.io/badge/R-%3E%3D4.1.0-blue?logo=r)](https://www.r-project.org/)
 [![Shiny](https://img.shields.io/badge/Shiny-1.7%2B-brightgreen?logo=rstudio)](https://shiny.posit.co/)
