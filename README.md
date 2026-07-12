@@ -192,7 +192,17 @@ If you use this application or the data in your research, please cite:
 ```
 Meena, V. K. (2026). PlantBreedingSuite: An integrated open-source R Shiny dashboard for genetic diversity analysis, multi-environment trial stability, and multi-trait selection in crop breeding programmes. SoftwareX, 35, 102878. https://doi.org/10.1016/j.softx.2026.102878 
 ```
-
+@article{Meena2026PlantBreedingSuite,
+  author    = {Vijay Kamal Meena},
+  title     = {PlantBreedingSuite: An integrated open-source R Shiny dashboard for genetic diversity analysis, multi-environment trial stability, and multi-trait selection in crop breeding programmes},
+  journal   = {SoftwareX},
+  volume    = {35},
+  pages     = {102878},
+  year      = {2026},
+  issn      = {2352-7110},
+  doi       = {10.1016/j.softx.2026.102878},
+  publisher = {Elsevier}
+}
 ### Key Packages to Cite
 - **metan**: Olivoto & Lúcio (2020) *The Plant Phenome Journal* — doi:10.1002/ppj2.20017
 - **biotools**: Silva (2017) *R package* — CRAN
