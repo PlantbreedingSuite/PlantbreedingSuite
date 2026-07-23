@@ -737,6 +737,7 @@ d2UI <- function(id) {
     # ── MANOVA ──────────────────────────────────────────────
     tabItem("d2_manova",
             div(class="sec-bar","📊 D² — MANOVA"),
+            div(class="d2-alert","This step only applies to Option 1 (RCBD Replicated Raw Data). If you uploaded Option 2 \u2014 Genotype Means, there is no replication to fit a MANOVA error term \u2014 skip this tab and go straight to \u201CD\u00B2 Distances\u201D; it will use the covariance of the genotype means instead."),
             fluidRow(
               box(title="Multivariate ANOVA", width=12, status="success", solidHeader=TRUE,
                   actionButton(ns("btn_manova"), "▶  Run MANOVA", class="btn-success", icon=icon("play")),
@@ -1170,14 +1171,38 @@ d2Server <- function(id) {
     output$anova_tbl_dl_ui <- renderUI({ req(rv$ran_manova); downloadButton(session$ns("dl_anova"), "\u2B07  ANOVA per Trait (.csv)", class="btn-warning btn-sm") })
     
     observeEvent(input$btn_d2, {
-      req(rv$covar, rv$data2)
+      req(rv$data2)
+      # rv$covar (the pooled experimental-error covariance matrix) is only ever
+      # populated by the MANOVA step, which requires REP-level raw data
+      # (Option 1). When Option 2 — Genotype Means — is used there is no
+      # replication, so no error matrix exists. In that case we fall back to
+      # the covariance matrix of the genotype means themselves so D² can
+      # still be computed, and we tell the user this is an approximation
+      # rather than silently doing nothing.
+      cov_to_use <- rv$covar
+      used_fallback_cov <- FALSE
+      if (is.null(cov_to_use)) {
+        if (isTRUE(rv$validated_means)) {
+          cov_to_use <- tryCatch(stats::cov(rv$data2[, -1, drop = FALSE]), error = function(e) NULL)
+          used_fallback_cov <- TRUE
+        }
+      }
+      if (is.null(cov_to_use)) {
+        showNotification("\u274C No covariance matrix is available yet. Run MANOVA first (Option 1), or upload Genotype Means (Option 2) and validate them.", type="error", duration=8)
+        return()
+      }
       withProgress(message="Computing D² distances…", value=.5, {
         tryCatch({
-          rv$d_dist <- D2.dist(rv$data2[,-1], rv$covar)
+          rv$d_dist <- D2.dist(rv$data2[,-1], cov_to_use)
           rv$dm     <- as.matrix(rv$d_dist)
           rownames(rv$dm) <- colnames(rv$dm) <- as.character(rv$data2[,1])
+          rv$covar  <- cov_to_use
           rv$ran_d2 <- TRUE
-          setProgress(1); showNotification("✅ D² complete!", type="message")
+          setProgress(1)
+          if (used_fallback_cov) {
+            showNotification("\u2139\uFE0F Genotype Means input has no experimental error term \u2014 D\u00B2 was computed using the covariance matrix of the genotype means (an approximation, not Rao's generalized distance with pooled error variance).", type="warning", duration=12)
+          }
+          showNotification("✅ D² complete!", type="message")
         }, error=function(e) showNotification(paste("❌",e$message), type="error"))
       })
     })
@@ -1602,7 +1627,7 @@ metUI <- function(id) {
     tabItem("met_home",
             div(class="home-banner", h2("🌾 Multi-Environment Trial Analysis Suite"),
                 p("AMMI · GGE · Stability · ANOVA · Descriptive Statistics"),
-                div(class="vtag","VERSION 2.0 | 2025")),
+                div(class="vtag","VERSION 1.0 | 2025")),
             fluidRow(
               column(4,div(class="feat-card",div(class="fi","📊"),h4("Descriptive Statistics"),p("Summary stats, histograms, boxplots, and interactive GxE heatmaps."))),
               column(4,div(class="feat-card",div(class="fi","🔬"),h4("ANOVA"),p("Individual + pooled ANOVA, GxE decomposition, Bartlett test."))),
@@ -2265,13 +2290,10 @@ selection_differential <- function(blup_mat, selected_geno, goals, method_nm) {
     tibble(Method=method_nm,Trait=tr,Goal=as_goal_words(goals[[tr]]),OverallMean=xo,SelectedMean=xs,SD=gn,SDpercent=gn/abs(xo)*100,DesiredGain=ifelse((goals[[tr]]=="h"&gn>0)|(goals[[tr]]=="l"&gn<0),"Yes","No"))
   }))
 }
-make_sh_index <- function(blup_mat, raw_data, traits, goals, si, econ_weights=NULL) {
+make_sh_index <- function(blup_mat, raw_data, traits, goals, si) {
   pm <- raw_data %>% group_by(GEN) %>% summarise(across(all_of(traits),~mean(.x,na.rm=TRUE)),.groups="drop")
   pcov <- pm%>%select(-GEN)%>%as.matrix()%>%cov(); gcov <- blup_mat%>%select(-GEN)%>%as.matrix()%>%cov()
-  sign_w <- ifelse(goals=="l",-1,1)
-  if(is.null(econ_weights)) econ_weights <- setNames(rep(1,length(goals)),names(goals))
-  econ_weights <- as.numeric(econ_weights[names(goals)])
-  weights <- sign_w * econ_weights
+  weights <- ifelse(goals=="l",-1,1)
   Smith_Hazel(blup_mat%>%column_to_rownames("GEN")%>%as.matrix(),pcov=pcov,gcov=gcov,weights=weights,SI=si)
 }
 selection_overlap_table <- function(selected_list, total_n) {
@@ -2496,17 +2518,12 @@ mtUI <- function(id) {
             div(class="sec-bar","⚖️ MT — Smith-Hazel"),
             fluidRow(
               box(title="Options",width=3,status="success",solidHeader=TRUE,
-                  h5(style="color:#1B4332;margin:4px 0 7px;","Economic Weights:"),
-                  p(style="color:#777;font-size:11px;margin:0 0 8px;","Set the relative economic importance of each trait (as in metan::Smith_Hazel). Default = 1 for all traits; direction (higher/lower is better) is applied automatically from the Trait Goals set on the Data tab."),
-                  uiOutput(ns("ui_sh_weights")),
-                  actionButton(ns("btn_sh_reset_w"),"↺  Reset Weights to 1",class="btn-default btn-block",style="font-size:11px;margin-bottom:8px;"),
-                  hr(),
                   actionButton(ns("btn_sh"),"▶  Run Smith-Hazel",class="btn-success btn-block",icon=icon("play")), hr(),
                   downloadButton(ns("dl_sh_idx"),"⬇  SH Index",class="btn-warning btn-block")
               ),
               box(title="Smith-Hazel Results",width=9,status="success",solidHeader=TRUE,
                   tabsetPanel(
-                    tabPanel("📋 Index",      br(), uiOutput(ns("ui_sh_weights_used")), DTOutput(ns("tbl_sh"))),
+                    tabPanel("📋 Index",      br(), DTOutput(ns("tbl_sh"))),
                     tabPanel("📋 Selected",   br(), verbatimTextOutput(ns("txt_sh_sel"))),
                     tabPanel("📊 Circular",   dl_bar(ns("dl_plt_sh_circ")), plotOutput(ns("plt_sh_circ"),height="500px")),
                     tabPanel("📊 metan Default", dl_bar(ns("dl_plt_sh_def")), plotOutput(ns("plt_sh_def"),height="400px"))
@@ -2687,23 +2704,6 @@ mtServer <- function(id) {
       goals[!sapply(goals,is.null)]
     })
     selected_traits_r <- reactive({ req(numeric_trait_cols()); numeric_trait_cols() })
-    output$ui_sh_weights <- renderUI({
-      req(selected_traits_r()); trs <- selected_traits_r()
-      tagList(div(class="goal-grid",lapply(trs,function(tr){
-        div(class="goal-row",span(class="trait-name",tr),
-            numericInput(session$ns(paste0("shw_",tr)),NULL,value=1,min=0,step=0.1,width="90px"))
-      })))
-    })
-    observeEvent(input$btn_sh_reset_w, {
-      req(selected_traits_r())
-      for(tr in selected_traits_r()) updateNumericInput(session,paste0("shw_",tr),value=1)
-    })
-    sh_weights_r <- reactive({
-      req(selected_traits_r()); trs <- selected_traits_r()
-      w <- sapply(trs,function(tr) input[[paste0("shw_",tr)]]%||%1)
-      w <- suppressWarnings(as.numeric(w)); w[is.na(w)] <- 1
-      setNames(w,trs)
-    })
     observeEvent(input$btn_load, {
       mt_valmsg(NULL); processed_data(NULL)
       req(raw_data(),input$env_col,input$gen_col,input$rep_col)
@@ -2839,14 +2839,7 @@ mtServer <- function(id) {
     output$dl_plt_fai_def  <- downloadHandler(paste0("FAIBLUP_default_",Sys.Date(),".pdf"), function(f){ req(fai_r()); cairo_pdf(f,16,10); tryCatch({ p<-plot(fai_r()); print(p) },error=function(e){plot.new();title(e$message)}); dev.off() })
     output$dl_fai_idx      <- downloadHandler(paste0("FAIBLUP_index_",Sys.Date(),".xlsx"), function(f){ req(fai_tbl_r()); write_xlsx(as.data.frame(fai_tbl_r()),f) })
     
-    sh_r <- eventReactive(input$btn_sh, { req(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r()); tryCatch(make_sh_index(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r(),input$sel_intensity,sh_weights_r()),error=function(e){ showNotification(paste("Smith-Hazel error:",e$message),type="error");NULL }) })
-    sh_weights_used_r <- eventReactive(input$btn_sh, { sh_weights_r() })
-    output$ui_sh_weights_used <- renderUI({
-      req(sh_r(),sh_weights_used_r()); w <- sh_weights_used_r()
-      p(style="color:#555;font-size:12px;margin:0 0 8px;",
-        strong("Economic weights used: "),
-        paste(names(w),"=",format(w,digits=3),collapse="  |  "))
-    })
+    sh_r <- eventReactive(input$btn_sh, { req(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r()); tryCatch(make_sh_index(blup_mat_r(),processed_data(),selected_traits_r(),trait_goal_r(),input$sel_intensity),error=function(e){ showNotification(paste("Smith-Hazel error:",e$message),type="error");NULL }) })
     output$tbl_sh     <- renderDT({ req(sh_r()); fmt_dt(tryCatch(safe_df(sh_r()$index),error=function(e)data.frame(Error=e$message))) })
     output$txt_sh_sel <- renderPrint({ req(sh_r()); cat("Selected genotypes:\n"); print(tryCatch(as.character(sh_r()$sel_gen),error=function(e)"Error extracting")) })
     r_plt_sh_circ <- reactive({ req(sh_r()); df<-tryCatch(as.data.frame(sh_r()$index),error=function(e)NULL); req(df); gc<-if("GEN" %in% names(df))"GEN" else names(df)[1]; vc<-grep("^V1$|index|Score|value",names(df),value=TRUE,ignore.case=TRUE)[1]%||%names(df)[which(sapply(df,is.numeric))[1]]; sel<-tryCatch(as.character(sh_r()$sel_gen),error=function(e)character(0)); make_circular_index_plot(df,gc,vc,sel,"Smith-Hazel — Circular Index Plot","Individual Genetic Worth",lower_is_better=FALSE) })
@@ -3284,7 +3277,34 @@ body,.content-wrapper,.right-side{font-family:'Inter',sans-serif!important;backg
                                 h4(style="color:#1B4332;","Module 3 — Multi-Trait Selection Suite"),
                                 tags$ul(tags$li("MTSI, MGIDI, FAI-BLUP, Smith-Hazel"),tags$li("Direct selection on yield trait"),tags$li("Selection differentials (Table 3)"),tags$li("Coincidence index & 4-way Venn diagram"),tags$li("GT/GYT biplots & Radar chart")), br(),
                                 p(strong("Key packages:"),"metan, biotools, FactoMineR, ggplot2, plotly, corrplot, fmsb"),
-                                div(class="app-footer","Version 2.0 | 2025 | Agriculture University Jodhpur")
+                                div(class="app-footer","Version 1.0 | 2025 | Agriculture University Jodhpur")
+                            )
+                     )
+                   ),
+                   fluidRow(
+                     column(12,
+                            box(title="How to Cite", width=12, status="success", solidHeader=TRUE,
+                                p("If you use PlantBreedingSuite in your research, please cite:"),
+                                div(class="d2-alert", style="background:#eef7f1;color:#155d34;line-height:1.6;",
+                                    "Meena, V. K. (2026). PlantBreedingSuite: An integrated open-source R Shiny dashboard for genetic diversity analysis, multi-environment trial stability, and multi-trait selection in crop breeding programmes. ",
+                                    tags$i("SoftwareX, 35"), ", 102878. ",
+                                    tags$a(href="https://doi.org/10.1016/j.softx.2026.102878", target="_blank", "https://doi.org/10.1016/j.softx.2026.102878")
+                                ),
+                                br(),
+                                p(strong("BibTeX:")),
+                                tags$pre(
+                                  "@article{meena2026plantbreedingsuite,
+  title   = {PlantBreedingSuite: An integrated open-source R Shiny dashboard for genetic
+             diversity analysis, multi-environment trial stability, and multi-trait
+             selection in crop breeding programmes},
+  author  = {Meena, Vijay Kamal},
+  journal = {SoftwareX},
+  volume  = {35},
+  pages   = {102878},
+  year    = {2026},
+  doi     = {10.1016/j.softx.2026.102878}
+}"
+                                )
                             )
                      )
                    )
